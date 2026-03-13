@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backward-compatible training entrypoint for K-Operators LM."""
+"""Main training entrypoint for K-Operators language model."""
 
 from k_operators.train_app import main
 

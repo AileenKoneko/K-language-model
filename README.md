@@ -10,8 +10,50 @@ It supports:
 - optional `torch.compile`,
 - strict reproducibility mode.
 
+## Results
+
+Latest deterministic evals in this repo (run on March 13, 2026):
+
+- Flags: `--deterministic --no-tf32 --skip-sample`
+- Sweep architecture flags: `--d-model 128 --window 256 --n-k2 6 --head-mode gelu --head-mult 1 --rank 32 --refine-steps 1`
+- Checkpoint directory: `data/20260313_133317_26319`
+
+| Checkpoint | Step | Val CE | Val PPL |
+|---|---:|---:|---:|
+| `run_1_seed_42.pt` | 3250 | 1.4838 | 4.41 |
+| `run_2_seed_42.pt` | 3250 | 1.4811 | 4.40 |
+| `run_3_seed_42.pt` | 2750 | 1.4876 | 4.43 |
+| `run_4_seed_69.pt` | 3000 | 1.5046 | 4.50 |
+| `run_5_seed_420.pt` | 3500 | 1.4878 | 4.43 |
+| `run_6_seed_666.pt` | 3250 | 1.4980 | 4.47 |
+| `run_7_seed_2137.pt` | 3250 | 1.4733 | 4.36 |
+
+Aggregate over the 7-run sweep:
+
+- Mean val CE: `1.4880` (std `0.0097`)
+- Mean val PPL: `4.4286` (std `0.0426`)
+- Best checkpoint: `run_7_seed_2137.pt` with `val_ce=1.4733`, `val_ppl=4.36`
+
+Reference checkpoint (`models/char_shakespeare.pt`) deterministic eval with matching architecture:
+
+- `val_ce=1.4773`
+- `val_ppl=4.38`
+
+Reproduce one eval:
+
+```bash
+python infer.py \
+  --ckpt data/20260313_133317_26319/run_7_seed_2137.pt \
+  --deterministic --no-tf32 --skip-sample \
+  --d-model 128 --window 256 --n-k2 6 \
+  --head-mode gelu --head-mult 1 --rank 32 --refine-steps 1
+```
+
+Note: TF32 affects CUDA kernels only. On CPU/MPS runs, `--no-tf32` has no practical effect.
+
 ## Contents
 
+- [Results](#results)
 - [Project Layout](#project-layout)
 - [Quick Start](#quick-start)
 - [Training](#training)
@@ -277,6 +319,7 @@ Behavior:
 - Inference load (`load_model_checkpoint`) restores model only.
 - Checkpoint loader normalizes some prefixes (`_orig_mod.`, `module.`) for compatibility.
 - State-dict load uses `strict=False` and logs missing/unexpected keys.
+- Shape mismatches (for example wrong `d-model`/`window`/`n-k2`) still raise a hard load error.
 
 ## CLI Reference
 

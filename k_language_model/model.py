@@ -306,29 +306,40 @@ class KStackModel(nn.Module):
             h = self.k_stack(h)
         else:
             eta = self.eta().to(dtype=h.dtype, device=h.device)
-            loop_deltas = [] if not self.training else None
+            # Eval-only diagnostics: track refinement deltas only in eval mode.
+            eval_loop_deltas = [] if not self.training else None
             for _ in range(steps):
                 h_new = self.k_stack(h)
-                if loop_deltas is not None:
+                if eval_loop_deltas is not None:
                     delta = (h_new - h).norm() / (h.norm() + 1e-6)
-                    loop_deltas.append(float(delta.detach().item()))
+                    eval_loop_deltas.append(float(delta.detach().item()))
                 h = h + eta * (h_new - h)
-            if loop_deltas is not None:
-                self._record_eval_refine_diagnostics(loop_deltas)
+            if eval_loop_deltas is not None:
+                self._record_eval_refine_diagnostics(eval_loop_deltas)
         h = self.norm(h)
 
         if self.head_mode == "gelu":
-            h = self.head[0](h)
-            h = self.head[1](h)
-            h = self.head[2](h)
-            h = self.head_drop(h)
-            return self.head[3](h)
+            h = self.head_drop(self.head[:-1](h))
+            return self.head[-1](h)
 
         return self.head(h)
 
     def count_params(self) -> Dict[str, int]:
-        total = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        emb = self.emb.weight.numel()
-        stack = sum(p.numel() for p in self.k_stack.parameters() if p.requires_grad)
-        head = sum(p.numel() for p in self.head.parameters() if p.requires_grad)
+        def _count_unique(params, skip_ptrs: set[int] | None = None) -> tuple[int, set[int]]:
+            seen = set() if skip_ptrs is None else set(skip_ptrs)
+            total_count = 0
+            for p in params:
+                if not p.requires_grad:
+                    continue
+                ptr = p.data_ptr()
+                if ptr in seen:
+                    continue
+                seen.add(ptr)
+                total_count += p.numel()
+            return total_count, seen
+
+        emb, emb_ptrs = _count_unique(self.emb.parameters())
+        stack, emb_stack_ptrs = _count_unique(self.k_stack.parameters(), skip_ptrs=emb_ptrs)
+        head, _ = _count_unique(self.head.parameters(), skip_ptrs=emb_stack_ptrs)
+        total, _ = _count_unique(self.parameters())
         return {"total": total, "embedding": emb, "k_stack": stack, "head": head}

@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # Usage:
-#   bash k_neurons/configs/colab_seed_sweep.sh [LOG_PATH]
+#   bash configs/colab_seed_sweep.sh [LOG_PATH]
 #
 # Example:
-#   bash k_neurons/configs/colab_seed_sweep.sh \
+#   bash configs/colab_seed_sweep.sh \
 #     /content/drive/MyDrive/k_language_model/logs/k_lm_seed_sweep.log
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -31,10 +31,10 @@ if [[ -n "$SCRIPT_PATH" ]]; then
   fi
 elif [[ -f "k_lm.py" ]]; then
   SCRIPT_PATH="k_lm.py"
-elif [[ -f "k_neurons/k_lm.py" ]]; then
-  SCRIPT_PATH="k_neurons/k_lm.py"
+elif [[ -f "train.py" ]]; then
+  SCRIPT_PATH="train.py"
 else
-  echo "Could not find k_lm.py. Run from repo root or /content." >&2
+  echo "Could not find k_lm.py or train.py. Run from the k_operators directory or set SCRIPT_PATH." >&2
   exit 1
 fi
 

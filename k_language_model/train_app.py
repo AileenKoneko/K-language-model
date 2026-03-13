@@ -35,6 +35,9 @@ def build_parser(description: str | None = None) -> argparse.ArgumentParser:
     p.add_argument("--head-mode", type=str, choices=["linear", "gelu"], default="linear")
     p.add_argument("--head-mult", type=int, default=6)
     p.add_argument("--head-dropout", type=float, default=0.10)
+    p.add_argument("--emb-dropout", type=float, default=0.08)
+    p.add_argument("--mlp-dropout", type=float, default=0.10)
+    p.add_argument("--residual-dropout", type=float, default=0.05)
     p.add_argument(
         "--refine-steps",
         type=int,
@@ -80,6 +83,11 @@ def build_parser(description: str | None = None) -> argparse.ArgumentParser:
     )
     p.set_defaults(fused_adamw=True)
     p.add_argument("--eval-interval", type=int, default=250)
+    p.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Enable verbose diagnostic logging (grad stats, layer stats, update/weight ratios) at eval intervals.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--deterministic",
@@ -210,6 +218,9 @@ def main() -> None:
         rank=args.rank,
         n_k2=args.n_k2,
         alpha_cap=args.alpha_cap,
+        emb_dropout=args.emb_dropout,
+        mlp_dropout=args.mlp_dropout,
+        residual_dropout=args.residual_dropout,
         batch_size=args.batch_size,
         steps=args.steps,
         lr=args.lr,
@@ -225,6 +236,7 @@ def main() -> None:
         optimizer_mode=args.optimizer_mode,
         use_fused_adamw=args.fused_adamw,
         eval_interval=args.eval_interval,
+        diagnostics=args.diagnostics,
     )
 
     model = KStackModel(

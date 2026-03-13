@@ -31,7 +31,7 @@ k_operators/
 ├── train.py                      # Main training entrypoint
 ├── infer.py                      # Main inference/eval entrypoint
 ├── k_lm.py                       # Backward-compatible alias to train.py
-├── k_operators/
+├── k_language_model/
 │   ├── train_app.py              # Training CLI and orchestration
 │   ├── infer_app.py              # Inference/eval CLI and orchestration
 │   ├── trainer.py                # Train loop, eval loop, optimizer/scheduler
@@ -61,7 +61,7 @@ Minimum runtime dependencies (from imports):
 Example:
 
 ```bash
-cd k_language_model
+cd k_operators
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
@@ -73,10 +73,16 @@ Notes:
 - The code picks device automatically: `cuda` -> `mps` -> `cpu`.
 - AMP is enabled on CUDA only.
 
+Optional editable install (enables `k-lm-train` / `k-lm-infer` console commands):
+
+```bash
+pip install -e .
+```
+
 ### 2) First training run
 
 ```bash
-cd k_language_model
+cd k_operators
 python train.py \
   --steps 2000 \
   --eval-interval 200 \
@@ -130,8 +136,10 @@ python train.py \
 - Model shape: `--window`, `--d-model`, `--rank`, `--n-k2`, `--head-mode`, `--head-mult`
 - Refinement behavior: `--refine-steps`, `--train-refine-steps`, `--alpha-cap`, `--decay-impl`
 - Optimization: `--lr`, `--lr-floor`, `--warmup-steps`, `--weight-decay`, `--optimizer-mode`
+- Regularization: `--emb-dropout`, `--mlp-dropout`, `--residual-dropout`, `--head-dropout`
 - CUDA perf: `--fused-adamw`, `--compile`, `--compile-mode`
 - Reproducibility: `--seed`, `--deterministic`, `--strict-repro`, `--run-manifest`
+- Extra logging: `--diagnostics` for verbose research/debug stats
 
 ## Evaluation and Inference
 
@@ -178,7 +186,7 @@ Both training (`--sample`) and inference support the same generation controls:
 
 ## Model Architecture
 
-The model is defined in `k_operators/model.py`.
+The model is defined in `k_language_model/model.py`.
 
 High-level structure:
 
@@ -219,7 +227,7 @@ h <- h + eta * (KStack(h) - h)
 
 ## Reproducibility and Runtime Behavior
 
-Runtime behavior is managed in `k_operators/runtime.py`.
+Runtime behavior is managed in `k_language_model/runtime.py`.
 
 - Device selection: CUDA first, then MPS, then CPU.
 - AMP: enabled on CUDA (`bfloat16` autocast path).
@@ -243,7 +251,7 @@ Use `--run-manifest path/to/manifest.json` to persist:
 
 ## Checkpoints
 
-Checkpoint logic is in `k_operators/checkpoint.py`.
+Checkpoint logic is in `k_language_model/checkpoint.py`.
 
 Saved format:
 
@@ -253,12 +261,19 @@ Saved format:
   "best_ppl": float,
   "model": model.state_dict(),
   "optimizer": optimizer.state_dict(),
+  "rng_state": {
+    "torch_cpu": ...,
+    "torch_cuda": ...,
+    "numpy": ...,
+    "python": ...,
+  },
 }
 ```
 
 Behavior:
 
 - Training resume (`load_checkpoint`) restores model + optimizer when available.
+- Training resume restores RNG state when available, improving reproducibility after interruptions.
 - Inference load (`load_model_checkpoint`) restores model only.
 - Checkpoint loader normalizes some prefixes (`_orig_mod.`, `module.`) for compatibility.
 - State-dict load uses `strict=False` and logs missing/unexpected keys.
@@ -325,6 +340,16 @@ Use:
 ```
 
 and avoid changing runtime stack (PyTorch/CUDA version, hardware, driver).
+
+### NumPy 2 compatibility warning
+
+If you see a warning about modules compiled for NumPy 1.x not running under NumPy 2.x, reinstall with:
+
+```bash
+pip install -r requirements.txt
+```
+
+This project pins `numpy<2` to stay compatible with common PyTorch builds.
 
 ### No checkpoint file created
 

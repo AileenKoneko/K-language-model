@@ -1,11 +1,58 @@
 import math
+import random
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 
 from .runtime import DEVICE, LOG, _unwrap_model
+
+
+def _capture_rng_state() -> Dict[str, object]:
+    state: Dict[str, object] = {
+        "torch_cpu": torch.random.get_rng_state(),
+        "numpy": np.random.get_state(),
+        "python": random.getstate(),
+    }
+    if torch.cuda.is_available():
+        try:
+            state["torch_cuda"] = torch.cuda.get_rng_state_all()
+        except RuntimeError:
+            state["torch_cuda"] = None
+    return state
+
+
+def _restore_rng_state(state: object) -> bool:
+    if not isinstance(state, dict):
+        return False
+
+    restored = False
+    torch_cpu = state.get("torch_cpu")
+    if torch_cpu is not None:
+        torch.random.set_rng_state(torch_cpu)
+        restored = True
+
+    torch_cuda = state.get("torch_cuda")
+    if torch_cuda is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(torch_cuda)
+            restored = True
+        except RuntimeError as exc:
+            LOG.warning("CUDA RNG state not restored (%s). Continuing.", exc)
+
+    numpy_state = state.get("numpy")
+    if numpy_state is not None:
+        np.random.set_state(numpy_state)
+        restored = True
+
+    python_state = state.get("python")
+    if python_state is not None:
+        random.setstate(python_state)
+        restored = True
+
+    return restored
 
 
 def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer, step: int, best_ppl: float) -> None:
@@ -15,6 +62,7 @@ def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimiz
             "best_ppl": best_ppl,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "rng_state": _capture_rng_state(),
         },
         path,
     )
@@ -69,6 +117,8 @@ def _log_state_load_mismatch(missing_keys: List[str], unexpected_keys: List[str]
 
 
 def load_model_checkpoint(path: Path, model: nn.Module) -> Tuple[int | None, float | None]:
+    # This repository stores full training snapshots (not just tensors), so weights_only=False is intentional.
+    # Do not load untrusted checkpoints.
     ck = torch.load(path, map_location=DEVICE, weights_only=False)
     state, step, best_ppl = _extract_checkpoint_model_state(ck)
     core_model = _unwrap_model(model)
@@ -81,6 +131,8 @@ def load_model_checkpoint(path: Path, model: nn.Module) -> Tuple[int | None, flo
 
 
 def load_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer) -> Tuple[int, float]:
+    # This repository stores full training snapshots (not just tensors), so weights_only=False is intentional.
+    # Do not load untrusted checkpoints.
     ck = torch.load(path, map_location=DEVICE, weights_only=False)
     state, step, best_ppl = _extract_checkpoint_model_state(ck)
     core_model = _unwrap_model(model)
@@ -95,13 +147,18 @@ def load_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimiz
         except ValueError as exc:
             LOG.warning("Optimizer state not loaded (%s). Continuing with fresh optimizer state.", exc)
 
+    rng_restored = False
+    if isinstance(ck, dict) and "rng_state" in ck:
+        rng_restored = _restore_rng_state(ck["rng_state"])
+
     step_out = 0 if step is None else int(step)
     best_ppl_out = float("inf") if best_ppl is None else float(best_ppl)
     LOG.info(
-        "Checkpoint loaded | step=%d | best_ppl=%s | optimizer_loaded=%s | path=%s",
+        "Checkpoint loaded | step=%d | best_ppl=%s | optimizer_loaded=%s | rng_restored=%s | path=%s",
         step_out,
         "inf" if math.isinf(best_ppl_out) else f"{best_ppl_out:.3f}",
         str(optimizer_loaded).lower(),
+        str(rng_restored).lower(),
         path,
     )
     return step_out, best_ppl_out

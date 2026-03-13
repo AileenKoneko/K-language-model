@@ -45,7 +45,8 @@ def eval_deterministic(model: nn.Module, data: torch.Tensor, window: int, batch_
         y = y_all[start: start + batch_size]
 
         with _autocast_context():
-            logits = core_model(x)
+            # Use the outer model call so eval can benefit from torch.compile when enabled.
+            logits = model(x)
             loss = F.cross_entropy(logits.reshape(-1, core_model.vocab_size), y.reshape(-1), reduction="sum")
 
         total_loss += loss.item()
@@ -85,6 +86,7 @@ class TrainConfig:
     min_improve_ce: float = 1e-4
     plateau_patience_evals: int = 8
     grad_topk: int = 3
+    diagnostics: bool = False
 
 
 def _collect_grad_stats(model: nn.Module, topk: int = 3) -> Dict[str, object]:
@@ -231,6 +233,7 @@ def _collect_update_weight_stats(
     lr_now: float,
     topk: int = 5,
 ) -> Dict[str, object]:
+    """Estimate Adam update/weight ratios using exp_avg as a proxy (diagnostic only)."""
     ratios = []
     by_layer = {}
 
@@ -400,7 +403,7 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
             scheduler.step()
             train_loss = float(loss.item())
             train_loss_ema = train_loss if train_loss_ema is None else 0.95 * train_loss_ema + 0.05 * train_loss
-            if not math.isnan(raw_grad_norm):
+            if cfg.diagnostics and not math.isnan(raw_grad_norm):
                 grad_norm_hist.append(raw_grad_norm)
 
         step_elapsed = time.time() - t0
@@ -413,13 +416,14 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
 
         if step % cfg.eval_interval == 0:
             ce, ppl = eval_deterministic(model, val_data, cfg.window, cfg.batch_size)
-            val_ce_hist.append(ce)
-            improved = ce < (best_ce - cfg.min_improve_ce)
-            if improved:
-                best_ce = ce
-                stale_evals = 0
-            else:
-                stale_evals += 1
+            if cfg.diagnostics:
+                val_ce_hist.append(ce)
+                improved = ce < (best_ce - cfg.min_improve_ce)
+                if improved:
+                    best_ce = ce
+                    stale_evals = 0
+                else:
+                    stale_evals += 1
 
             if ppl < best_ppl:
                 best_ppl = ppl
@@ -437,34 +441,8 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
             lr_now = optimizer.param_groups[0]["lr"]
             train_str = "N/A" if math.isnan(train_loss) else f"{train_loss:.4f}"
             train_ema_str = "N/A" if train_loss_ema is None else f"{train_loss_ema:.4f}"
-            grad_stats = _collect_grad_stats(model, topk=cfg.grad_topk)
-            top_grad = ", ".join(f"{n}={v:.2e}" for n, v in grad_stats["top_grad_params"]) or "none"
-            k_stats = _collect_k_layer_stats(model)
-            eval_refine_stats = _collect_eval_refine_stats(model)
-            clip_hit = (not math.isnan(raw_grad_norm)) and (raw_grad_norm > cfg.clip_grad_norm)
-            grad_window = sum(grad_norm_hist) / len(grad_norm_hist) if grad_norm_hist else float("nan")
-            val_window_drop = (val_ce_hist[0] - val_ce_hist[-1]) if len(val_ce_hist) >= 2 else float("nan")
-            uw_stats = _collect_update_weight_stats(model, optimizer, lr_now, topk=5)
-            top_uw = ", ".join(f"{n}={v:.2e}" for n, v in uw_stats["top"]) or "none"
-            layer_order = sorted(
-                uw_stats["by_layer"].keys(),
-                key=lambda k: (
-                    0 if k == "emb" else
-                    1 if k.startswith("k_stack.layers.") else
-                    2 if k == "k_stack" else
-                    3 if k == "final_norm" else
-                    4 if k == "head" else
-                    5,
-                    k,
-                ),
-            )
-            uw_by_layer = " | ".join(
-                f"{k}[{uw_stats['by_layer'][k]['min']:.1e}/{uw_stats['by_layer'][k]['mean']:.1e}/{uw_stats['by_layer'][k]['max']:.1e}]"
-                for k in layer_order
-            ) or "none"
-
             LOG.info(
-                "step=%5d | train_ce=%s | train_ce_ema=%s | val_ce=%.4f | val_ppl=%.2f | best_ppl=%.2f | lr=%.2e | %s ms/step | %s tok/s | gnorm=%.2e | gnorm_clip=%.2e | clip_hit=%s | gmax=%.2e | g_sparsity=%.2f%% | stale=%d | uw[min/mean/max]=%.2e/%.2e/%.2e",
+                "step=%5d | train_ce=%s | train_ce_ema=%s | val_ce=%.4f | val_ppl=%.2f | best_ppl=%.2f | lr=%.2e | %s ms/step | %s tok/s",
                 step,
                 train_str,
                 train_ema_str,
@@ -474,32 +452,61 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                 lr_now,
                 avg_ms_str,
                 tok_s_str,
-                grad_stats["total_grad_norm"],
-                raw_grad_norm,
-                str(clip_hit).lower(),
-                grad_stats["max_abs_grad"],
-                grad_stats["grad_sparsity"] * 100.0,
-                stale_evals,
-                uw_stats["min"],
-                uw_stats["mean"],
-                uw_stats["max"],
             )
-            LOG.info("grad_top_params | %s", top_grad)
-            LOG.info("update_weight_top_params | %s", top_uw)
-            LOG.info("update_weight_by_layer[min/mean/max] | %s", uw_by_layer)
-            if k_stats:
-                LOG.info("layer_stats | %s", k_stats)
-            if eval_refine_stats:
-                LOG.info("eval_refinement | %s", eval_refine_stats)
-            if stale_evals >= cfg.plateau_patience_evals:
-                LOG.warning(
-                    "Plateau detected | stale_evals=%d | val_ce_delta_window=%.4f | avg_gnorm_window=%.2e | lr=%.2e | clip_hit=%s",
-                    stale_evals,
-                    val_window_drop,
-                    grad_window,
-                    lr_now,
-                    str(clip_hit).lower(),
+            if cfg.diagnostics:
+                grad_stats = _collect_grad_stats(model, topk=cfg.grad_topk)
+                top_grad = ", ".join(f"{n}={v:.2e}" for n, v in grad_stats["top_grad_params"]) or "none"
+                k_stats = _collect_k_layer_stats(model)
+                eval_refine_stats = _collect_eval_refine_stats(model)
+                clip_hit = (not math.isnan(raw_grad_norm)) and (raw_grad_norm > cfg.clip_grad_norm)
+                grad_window = sum(grad_norm_hist) / len(grad_norm_hist) if grad_norm_hist else float("nan")
+                val_window_drop = (val_ce_hist[0] - val_ce_hist[-1]) if len(val_ce_hist) >= 2 else float("nan")
+                uw_stats = _collect_update_weight_stats(model, optimizer, lr_now, topk=5)
+                top_uw = ", ".join(f"{n}={v:.2e}" for n, v in uw_stats["top"]) or "none"
+                layer_order = sorted(
+                    uw_stats["by_layer"].keys(),
+                    key=lambda k: (
+                        0 if k == "emb" else
+                        1 if k.startswith("k_stack.layers.") else
+                        2 if k == "k_stack" else
+                        3 if k == "final_norm" else
+                        4 if k == "head" else
+                        5,
+                        k,
+                    ),
                 )
+                uw_by_layer = " | ".join(
+                    f"{k}[{uw_stats['by_layer'][k]['min']:.1e}/{uw_stats['by_layer'][k]['mean']:.1e}/{uw_stats['by_layer'][k]['max']:.1e}]"
+                    for k in layer_order
+                ) or "none"
+                LOG.info(
+                    "diagnostics | gnorm=%.2e | gnorm_clip=%.2e | clip_hit=%s | gmax=%.2e | g_sparsity=%.2f%% | stale=%d | adam_expavg_weight[min/mean/max]=%.2e/%.2e/%.2e",
+                    grad_stats["total_grad_norm"],
+                    raw_grad_norm,
+                    str(clip_hit).lower(),
+                    grad_stats["max_abs_grad"],
+                    grad_stats["grad_sparsity"] * 100.0,
+                    stale_evals,
+                    uw_stats["min"],
+                    uw_stats["mean"],
+                    uw_stats["max"],
+                )
+                LOG.info("grad_top_params | %s", top_grad)
+                LOG.info("adam_expavg_weight_top_params | %s", top_uw)
+                LOG.info("adam_expavg_weight_by_layer[min/mean/max] | %s", uw_by_layer)
+                if k_stats:
+                    LOG.info("layer_stats | %s", k_stats)
+                if eval_refine_stats:
+                    LOG.info("eval_refinement | %s", eval_refine_stats)
+                if stale_evals >= cfg.plateau_patience_evals:
+                    LOG.warning(
+                        "Plateau detected | stale_evals=%d | val_ce_delta_window=%.4f | avg_gnorm_window=%.2e | lr=%.2e | clip_hit=%s",
+                        stale_evals,
+                        val_window_drop,
+                        grad_window,
+                        lr_now,
+                        str(clip_hit).lower(),
+                    )
             step_times.clear()
 
     return best_ppl

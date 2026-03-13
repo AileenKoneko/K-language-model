@@ -10,6 +10,8 @@ It supports:
 - optional `torch.compile`,
 - strict reproducibility mode.
 
+Archive: [Zenodo record 19004569](https://zenodo.org/records/19004569)
+
 ## Results
 
 Latest deterministic evals in this repo (run on March 13, 2026):

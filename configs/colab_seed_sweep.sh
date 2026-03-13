@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # Example:
 #   bash k_neurons/configs/colab_seed_sweep.sh \
-#     /content/drive/MyDrive/k_operators/logs/k_lm_seed_sweep.log
+#     /content/drive/MyDrive/k_language_model/logs/k_lm_seed_sweep.log
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 SCRIPT_PATH="${SCRIPT_PATH:-}"

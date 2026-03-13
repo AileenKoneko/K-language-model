@@ -61,7 +61,7 @@ Minimum runtime dependencies (from imports):
 Example:
 
 ```bash
-cd k_operators
+cd k_language_model
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
@@ -76,7 +76,7 @@ Notes:
 ### 2) First training run
 
 ```bash
-cd k_operators
+cd k_language_model
 python train.py \
   --steps 2000 \
   --eval-interval 200 \

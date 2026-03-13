@@ -8,6 +8,29 @@ import torch.nn.functional as F
 from .runtime import GAMMA_FLOOR
 
 
+def _is_torch_compiling() -> bool:
+    # Prefer the public API when available; fall back to torch._dynamo for older versions.
+    compiler_mod = getattr(torch, "compiler", None)
+    if compiler_mod is not None:
+        is_compiling_fn = getattr(compiler_mod, "is_compiling", None)
+        if callable(is_compiling_fn):
+            try:
+                return bool(is_compiling_fn())
+            except Exception:
+                pass
+
+    dynamo_mod = getattr(torch, "_dynamo", None)
+    if dynamo_mod is not None:
+        is_compiling_fn = getattr(dynamo_mod, "is_compiling", None)
+        if callable(is_compiling_fn):
+            try:
+                return bool(is_compiling_fn())
+            except Exception:
+                pass
+
+    return False
+
+
 class RMSNorm(nn.Module):
     def __init__(self, d: int, eps: float = 1e-8):
         super().__init__()
@@ -306,8 +329,9 @@ class KStackModel(nn.Module):
             h = self.k_stack(h)
         else:
             eta = self.eta().to(dtype=h.dtype, device=h.device)
-            # Eval-only diagnostics: track refinement deltas only in eval mode.
-            eval_loop_deltas = [] if not self.training else None
+            # Eval-only diagnostics are disabled while compiling to avoid graph breaks from scalar extraction.
+            collect_eval_refine_diag = (not self.training) and (not _is_torch_compiling())
+            eval_loop_deltas = [] if collect_eval_refine_diag else None
             for _ in range(steps):
                 h_new = self.k_stack(h)
                 if eval_loop_deltas is not None:
@@ -319,8 +343,11 @@ class KStackModel(nn.Module):
         h = self.norm(h)
 
         if self.head_mode == "gelu":
-            h = self.head_drop(self.head[:-1](h))
-            return self.head[-1](h)
+            h = self.head[0](h)
+            h = self.head[1](h)
+            h = self.head[2](h)
+            h = self.head_drop(h)
+            return self.head[3](h)
 
         return self.head(h)
 

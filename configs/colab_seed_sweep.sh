@@ -14,6 +14,7 @@ DEFAULT_LOG="/content/drive/MyDrive/k_operators/logs/k_lm_seed_sweep_$(date +%Y%
 LOG_PATH="${1:-$DEFAULT_LOG}"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)_$$"
 CACHE_ROOT="${CACHE_ROOT:-/tmp/k_lm_compile_cache_${RUN_TAG}}"
+CKPT_ROOT="${CKPT_ROOT:-/content/drive/MyDrive/k_operators/checkpoints/${RUN_TAG}}"
 
 if [[ "$LOG_PATH" == /content/drive/* ]] && [[ ! -d /content/drive/MyDrive ]]; then
   echo "Google Drive is not mounted at /content/drive/MyDrive." >&2
@@ -23,6 +24,7 @@ if [[ "$LOG_PATH" == /content/drive/* ]] && [[ ! -d /content/drive/MyDrive ]]; t
 fi
 
 mkdir -p "$(dirname "$LOG_PATH")"
+mkdir -p "$CKPT_ROOT"
 
 if [[ -n "$SCRIPT_PATH" ]]; then
   if [[ ! -f "$SCRIPT_PATH" ]]; then
@@ -47,12 +49,18 @@ BASE_ARGS=(
   --rank 32
   --window 256
   --optimizer-mode simple
+  --fused-adamw
   --batch-size 64
-  --steps 4000
+  --steps 3500
   --eval-interval 250
   --compile
-  --lr 8e-3
-  --warmup-steps 1500
+  --compile-mode default
+  --lr 10e-3
+  --warmup-steps 2000
+  --alpha-cap 0.8
+  --decay-impl mask
+  --lr-floor 3.5e-04
+  --head-dropout 0.15
 )
 
 SEEDS=(42 42 42 69 420 666 2137)
@@ -64,6 +72,7 @@ TOTAL_RUNS="${#SEEDS[@]}"
   echo "python_bin=$PYTHON_BIN"
   echo "script=$SCRIPT_PATH"
   echo "cache_root=$CACHE_ROOT"
+  echo "ckpt_root=$CKPT_ROOT"
   echo "base_args=${BASE_ARGS[*]}"
   echo "seeds=${SEEDS[*]}"
   echo
@@ -76,19 +85,21 @@ for idx in "${!SEEDS[@]}"; do
   run_inductor_cache="${run_cache_dir}/inductor"
   run_triton_cache="${run_cache_dir}/triton"
   run_cuda_cache="${run_cache_dir}/cuda"
+  run_ckpt="${CKPT_ROOT}/run_${run_no}_seed_${seed}.pt"
   mkdir -p "$run_inductor_cache" "$run_triton_cache" "$run_cuda_cache"
 
   {
     echo "========== RUN ${run_no}/${TOTAL_RUNS} | seed=${seed} =========="
     echo "start_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    echo "cmd=$PYTHON_BIN $SCRIPT_PATH ${BASE_ARGS[*]} --seed $seed"
+    echo "ckpt=$run_ckpt"
+    echo "cmd=$PYTHON_BIN $SCRIPT_PATH ${BASE_ARGS[*]} --seed $seed --ckpt $run_ckpt"
     echo "cache_dirs: inductor=$run_inductor_cache triton=$run_triton_cache cuda=$run_cuda_cache"
   } | tee -a "$LOG_PATH"
 
   TORCHINDUCTOR_CACHE_DIR="$run_inductor_cache" \
   TRITON_CACHE_DIR="$run_triton_cache" \
   CUDA_CACHE_PATH="$run_cuda_cache" \
-  "$PYTHON_BIN" "$SCRIPT_PATH" "${BASE_ARGS[@]}" --seed "$seed" 2>&1 | tee -a "$LOG_PATH"
+  "$PYTHON_BIN" "$SCRIPT_PATH" "${BASE_ARGS[@]}" --seed "$seed" --ckpt "$run_ckpt" 2>&1 | tee -a "$LOG_PATH"
 
   {
     echo "end_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"

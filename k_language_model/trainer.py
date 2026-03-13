@@ -45,8 +45,8 @@ def eval_deterministic(model: nn.Module, data: torch.Tensor, window: int, batch_
         y = y_all[start: start + batch_size]
 
         with _autocast_context():
-            # Use the outer model call so eval can benefit from torch.compile when enabled.
-            logits = model(x)
+            # Use unwrapped model for deterministic eval behavior (historical baseline).
+            logits = core_model(x)
             loss = F.cross_entropy(logits.reshape(-1, core_model.vocab_size), y.reshape(-1), reduction="sum")
 
         total_loss += loss.item()

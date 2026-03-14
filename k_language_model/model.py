@@ -87,6 +87,7 @@ class K2Layer(nn.Module):
         self.k_base_gate_logit = nn.Parameter(torch.tensor(8.0))
         self.register_buffer("causal_mask", causal)
         self.register_buffer("decay_diff", (pos.unsqueeze(1) - pos.unsqueeze(0)).clamp(min=0).contiguous())
+        self._causal_mask_smoke_checked = False
 
         self.u = nn.Parameter(torch.randn(d, rank) * 0.05)
         self.v = nn.Parameter(torch.randn(d, rank) * 0.05)
@@ -102,6 +103,15 @@ class K2Layer(nn.Module):
         batch, window, _ = h.shape
         if window > self.window:
             raise ValueError(f"Expected window <= {self.window}, got {window}")
+        if (not self._causal_mask_smoke_checked) and (not _is_torch_compiling()):
+            mask = self.causal_mask
+            if mask.ndim != 2 or mask.size(0) != self.window or mask.size(1) != self.window:
+                raise RuntimeError(
+                    f"causal_mask shape mismatch: expected ({self.window}, {self.window}), got {tuple(mask.shape)}"
+                )
+            if not torch.equal(mask, torch.tril(mask)):
+                raise RuntimeError("causal_mask must be lower triangular (triangular smoke test failed).")
+            self._causal_mask_smoke_checked = True
 
         residual = h
         h_norm = self.norm1(h)

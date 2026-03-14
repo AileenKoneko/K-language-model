@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 
 from .checkpoint import load_model_checkpoint
-from .data import load_shakespeare
+from .data import load_dataset
 from .generation import sample_text
 from .model import KStackModel
 from .runtime import (
@@ -18,11 +18,36 @@ from .runtime import (
     log_runtime_metadata,
     setup_logging,
 )
-from .trainer import _collect_eval_refine_stats, eval_deterministic
+from .trainer import _collect_eval_refine_stats, ce_to_bpc, eval_deterministic
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run inference/evaluation with a trained K-Stack checkpoint.")
+    p.add_argument(
+        "--dataset",
+        type=str,
+        choices=["shakespeare", "wikitext2"],
+        default="shakespeare",
+        help="Dataset preset used to build eval data/vocabulary.",
+    )
+    p.add_argument(
+        "--data-path",
+        type=str,
+        default=None,
+        help="Optional train/source text path. If omitted, built-in dataset files are used/downloaded.",
+    )
+    p.add_argument(
+        "--val-path",
+        type=str,
+        default=None,
+        help="Optional validation text path. If omitted, preset val split is used or val_frac split is applied.",
+    )
+    p.add_argument(
+        "--val-frac",
+        type=float,
+        default=0.1,
+        help="Validation fraction used only when a separate validation file is not available/provided.",
+    )
     p.add_argument("--ckpt", "--checkpoint", dest="ckpt", type=str, required=True, help="Checkpoint path to load.")
     p.add_argument("--batch-size", type=int, default=256, help="Batch size used for deterministic validation eval.")
     p.add_argument("--window", type=int, default=512)
@@ -139,7 +164,12 @@ def main() -> None:
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    _, val_data, vocab_size, stoi, itos = load_shakespeare(val_frac=0.1)
+    _, val_data, vocab_size, stoi, itos = load_dataset(
+        dataset=args.dataset,
+        val_frac=args.val_frac,
+        data_path=args.data_path,
+        val_path=args.val_path,
+    )
 
     model = KStackModel(
         vocab_size=vocab_size,
@@ -185,14 +215,24 @@ def main() -> None:
         ce, ppl = eval_deterministic(model, val_data, args.window, args.batch_size)
         loaded_step_str = "N/A" if loaded_step is None else str(loaded_step)
         loaded_best_ppl_str = "N/A" if loaded_best_ppl is None else f"{loaded_best_ppl:.2f}"
-        LOG.info(
-            "Eval | step=%s | ckpt_best_ppl=%s | refine_steps=%d | val_ce=%.4f | val_ppl=%.2f",
-            loaded_step_str,
-            loaded_best_ppl_str,
-            core_model.refine_steps,
-            ce,
-            ppl,
-        )
+        if args.dataset == "wikitext2":
+            LOG.info(
+                "Eval | step=%s | ckpt_best_ppl=%s | refine_steps=%d | val_bpc=%.4f | val_ppl=%.2f",
+                loaded_step_str,
+                loaded_best_ppl_str,
+                core_model.refine_steps,
+                ce_to_bpc(ce),
+                ppl,
+            )
+        else:
+            LOG.info(
+                "Eval | step=%s | ckpt_best_ppl=%s | refine_steps=%d | val_ce=%.4f | val_ppl=%.2f",
+                loaded_step_str,
+                loaded_best_ppl_str,
+                core_model.refine_steps,
+                ce,
+                ppl,
+            )
         eval_refine_stats = _collect_eval_refine_stats(model)
         if eval_refine_stats:
             LOG.info("eval_refinement | %s", eval_refine_stats)

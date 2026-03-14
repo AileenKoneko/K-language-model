@@ -15,6 +15,10 @@ from .model import KStackModel
 from .runtime import DEVICE, GAMMA_FLOOR, LOG, USE_AMP, _autocast_context, _unwrap_model
 
 
+def ce_to_bpc(ce: float) -> float:
+    return float(ce) / math.log(2.0)
+
+
 @torch.no_grad()
 def eval_deterministic(model: nn.Module, data: torch.Tensor, window: int, batch_size: int) -> tuple[float, float]:
     model.eval()
@@ -87,6 +91,7 @@ class TrainConfig:
     plateau_patience_evals: int = 8
     grad_topk: int = 3
     diagnostics: bool = False
+    report_bpc: bool = False
 
 
 def _collect_grad_stats(model: nn.Module, topk: int = 3) -> Dict[str, object]:
@@ -439,20 +444,36 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                 avg_ms_str = "N/A"
                 tok_s_str = "N/A"
             lr_now = optimizer.param_groups[0]["lr"]
-            train_str = "N/A" if math.isnan(train_loss) else f"{train_loss:.4f}"
-            train_ema_str = "N/A" if train_loss_ema is None else f"{train_loss_ema:.4f}"
-            LOG.info(
-                "step=%5d | train_ce=%s | train_ce_ema=%s | val_ce=%.4f | val_ppl=%.2f | best_ppl=%.2f | lr=%.2e | %s ms/step | %s tok/s",
-                step,
-                train_str,
-                train_ema_str,
-                ce,
-                ppl,
-                best_ppl,
-                lr_now,
-                avg_ms_str,
-                tok_s_str,
-            )
+            if cfg.report_bpc:
+                train_str = "N/A" if math.isnan(train_loss) else f"{ce_to_bpc(train_loss):.4f}"
+                train_ema_str = "N/A" if train_loss_ema is None else f"{ce_to_bpc(train_loss_ema):.4f}"
+                LOG.info(
+                    "step=%5d | train_bpc=%s | train_bpc_ema=%s | val_bpc=%.4f | val_ppl=%.2f | best_ppl=%.2f | lr=%.2e | %s ms/step | %s tok/s",
+                    step,
+                    train_str,
+                    train_ema_str,
+                    ce_to_bpc(ce),
+                    ppl,
+                    best_ppl,
+                    lr_now,
+                    avg_ms_str,
+                    tok_s_str,
+                )
+            else:
+                train_str = "N/A" if math.isnan(train_loss) else f"{train_loss:.4f}"
+                train_ema_str = "N/A" if train_loss_ema is None else f"{train_loss_ema:.4f}"
+                LOG.info(
+                    "step=%5d | train_ce=%s | train_ce_ema=%s | val_ce=%.4f | val_ppl=%.2f | best_ppl=%.2f | lr=%.2e | %s ms/step | %s tok/s",
+                    step,
+                    train_str,
+                    train_ema_str,
+                    ce,
+                    ppl,
+                    best_ppl,
+                    lr_now,
+                    avg_ms_str,
+                    tok_s_str,
+                )
             if cfg.diagnostics:
                 grad_stats = _collect_grad_stats(model, topk=cfg.grad_topk)
                 top_grad = ", ".join(f"{n}={v:.2e}" for n, v in grad_stats["top_grad_params"]) or "none"

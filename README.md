@@ -3,7 +3,7 @@
 This directory contains a self-contained character-level language model built around a custom K-Stack backbone.  
 It supports:
 
-- training on Tiny Shakespeare,
+- training on Tiny Shakespeare or WikiText-2,
 - deterministic evaluation (cross-entropy/perplexity),
 - checkpoint save/resume/load,
 - text sampling with top-k/top-p/repetition controls,
@@ -14,7 +14,20 @@ Archive: [Zenodo record 19004569](https://zenodo.org/records/19004569)
 
 ## Results
 
-Latest deterministic evals in this repo (run on March 13, 2026):
+Post pre-print update (March 14th 2026):
+
+- Preliminary results on character-level WikiText-2. Hyperparameter sweeps and ablations are pending. Before moving to sentencepiece-level, I want to ensure the model is well-understood and tuned at the char level.
+- Shared flags: `--dataset wikitext2 --deterministic --no-tf32 --skip-sample --n-k2 6 --head-mode gelu --head-mult 1 --rank 32 --refine-steps 1`
+- Runtime/device: `mps`
+
+| Checkpoint                   | Step | Val BPC | Val PPL | Window | d-model | Params | Run hash |
+|------------------------------|---:|---:|---:|---:|---:|---:|---|
+| `models/wiki_256_256_10k.pt` | 10000 | 1.4978 | 2.82 | 256 | 256 | 3,337,421 | `9226ddba588c` |
+| `models/wiki_256_256_20k.pt` | 20000 | 1.4535 | 2.74 | 256 | 256 | 3,337,421 | `9ef711bf3282` |
+| `models/wiki_512_256_20k.pt` | 20000 | 1.4208 | 2.68 | 512 | 256 | 4,517,069 | `d67d459388a0` |
+| `models/wiki_512_128_20k.pt` | 20000 | 1.5306 | 2.89 | 512 | 128 | 2,373,325 | `5d6d1f245439` |
+
+Tiny Shakespeare seed-sweep deterministic evals (run on March 13, 2026):
 
 - Flags: `--deterministic --no-tf32 --skip-sample`
 - Sweep architecture flags: `--d-model 128 --window 256 --n-k2 6 --head-mode gelu --head-mult 1 --rank 32 --refine-steps 1`
@@ -82,10 +95,11 @@ k_operators/
 │   ├── model.py                  # K-Stack model definition
 │   ├── generation.py             # Text sampling implementation
 │   ├── checkpoint.py             # Save/load logic (model + optimizer)
-│   ├── data.py                   # Tiny Shakespeare download + tokenization
+│   ├── data.py                   # Dataset download/loading + character tokenization
 │   └── runtime.py                # Device, AMP, logging, reproducibility
 ├── data/
-│   └── input.txt                 # Tiny Shakespeare dataset cache
+│   ├── input.txt                 # Tiny Shakespeare dataset cache
+│   └── wikitext-2/               # WikiText-2 cache (auto-downloaded when used)
 ├── models/
 │   └── char_shakespeare.pt       # Example trained checkpoint
 └── configs/
@@ -177,6 +191,7 @@ python train.py \
 
 ### Useful training flags
 
+- Dataset/input: `--dataset {shakespeare,wikitext2}`, `--data-path`, `--val-path`, `--val-frac`
 - Model shape: `--window`, `--d-model`, `--rank`, `--n-k2`, `--head-mode`, `--head-mult`
 - Refinement behavior: `--refine-steps`, `--train-refine-steps`, `--alpha-cap`, `--decay-impl`
 - Optimization: `--lr`, `--lr-floor`, `--warmup-steps`, `--weight-decay`, `--optimizer-mode`
@@ -184,6 +199,44 @@ python train.py \
 - CUDA perf: `--fused-adamw`, `--compile`, `--compile-mode`
 - Reproducibility: `--seed`, `--deterministic`, `--strict-repro`, `--run-manifest`
 - Extra logging: `--diagnostics` for verbose research/debug stats
+
+### WikiText-2 training
+
+Built-in WikiText-2 preset:
+
+```bash
+python train.py \
+  --dataset wikitext2 \
+  --steps 3500 \
+  --window 256 \
+  --d-model 128 \
+  --n-k2 6 \
+  --rank 32 \
+  --head-mode gelu \
+  --head-mult 1 \
+  --refine-steps 1 \
+  --ckpt models/wiki_text2.pt
+```
+
+Custom text files:
+
+```bash
+python train.py \
+  --dataset wikitext2 \
+  --data-path /path/to/train.txt \
+  --val-path /path/to/valid.txt \
+  --ckpt models/wiki_text2_custom.pt
+```
+
+Colab sweep script supports dataset env vars too:
+
+```bash
+DATASET="wikitext2" \
+TRAIN_DATA_PATH="/content/data/wiki_train.txt" \
+VAL_DATA_PATH="/content/data/wiki_valid.txt" \
+SCRIPT_PATH="train.py" \
+bash configs/colab_seed_sweep.sh
+```
 
 ## Evaluation and Inference
 
@@ -213,7 +266,11 @@ python infer.py \
   --skip-sample
 ```
 
-Important: the architecture arguments (`--window`, `--d-model`, `--rank`, `--n-k2`, head/refinement flags) must match the checkpoint topology, or you will get missing/unexpected key warnings and degraded/invalid behavior.
+Important: dataset + tokenizer context must match the checkpoint.
+
+- Architecture arguments (`--window`, `--d-model`, `--rank`, `--n-k2`, head/refinement flags) must match.
+- Dataset arguments (`--dataset`, `--data-path`, `--val-path`, `--val-frac`) should match what was used when training the checkpoint.
+- Reporting mode: WikiText-2 logs use BPC (`train_bpc` / `val_bpc`), while Shakespeare logs keep CE (`train_ce` / `val_ce`).
 
 ## Sampling Controls
 
@@ -335,6 +392,7 @@ python infer.py --help
 ### `train.py` (selected high-impact args)
 
 - Core: `--steps`, `--batch-size`, `--eval-interval`, `--ckpt`
+- Dataset: `--dataset`, `--data-path`, `--val-path`, `--val-frac`
 - Model: `--window`, `--d-model`, `--rank`, `--n-k2`, `--head-mode`, `--head-mult`, `--head-dropout`
 - Refinement/decay: `--refine-steps`, `--train-refine-steps`, `--alpha-cap`, `--decay-impl`
 - Optimizer/schedule: `--lr`, `--lr-floor`, `--warmup-steps`, `--beta1`, `--beta2`, `--weight-decay`, `--optimizer-mode`
@@ -346,6 +404,7 @@ python infer.py --help
 ### `infer.py` (selected high-impact args)
 
 - Required: `--ckpt`
+- Dataset: `--dataset`, `--data-path`, `--val-path`, `--val-frac`
 - Eval: `--batch-size`, `--skip-eval`
 - Sampling: `--skip-sample`, `--prompt`, `--sample-tokens`, `--temperature`, `--top-k`, `--top-p`, `--repetition-penalty`, `--repetition-window`, `--prompt-lock-chars`
 - Architecture compatibility: `--window`, `--d-model`, `--rank`, `--n-k2`, `--head-*`, `--refine-steps`, `--train-refine-steps`, `--eval-refine-steps`, `--alpha-cap`, `--decay-impl`
@@ -375,6 +434,7 @@ Most likely architecture mismatch. Ensure the checkpoint is loaded with the same
 - `window`, `d-model`, `rank`, `n-k2`
 - head mode/mult/dropout
 - refine/decode related flags as required for shape compatibility
+- dataset and text sources (`--dataset`, `--data-path`, `--val-path`, `--val-frac`) to keep vocab consistent
 
 ### Reproducibility drift between runs
 

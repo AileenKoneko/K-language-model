@@ -15,6 +15,10 @@ LOG_PATH="${1:-$DEFAULT_LOG}"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)_$$"
 CACHE_ROOT="${CACHE_ROOT:-/tmp/k_lm_compile_cache_${RUN_TAG}}"
 CKPT_ROOT="${CKPT_ROOT:-/content/drive/MyDrive/k_operators/checkpoints/${RUN_TAG}}"
+DATASET="${DATASET:-shakespeare}"
+TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-}"
+VAL_DATA_PATH="${VAL_DATA_PATH:-}"
+VAL_FRAC="${VAL_FRAC:-0.1}"
 
 if [[ "$LOG_PATH" == /content/drive/* ]] && [[ ! -d /content/drive/MyDrive ]]; then
   echo "Google Drive is not mounted at /content/drive/MyDrive." >&2
@@ -41,6 +45,8 @@ else
 fi
 
 BASE_ARGS=(
+  --dataset "$DATASET"
+  --val-frac "$VAL_FRAC"
   --d-model 128
   --head-mode gelu
   --head-mult 1
@@ -63,6 +69,13 @@ BASE_ARGS=(
   --head-dropout 0.15
 )
 
+if [[ -n "$TRAIN_DATA_PATH" ]]; then
+  BASE_ARGS+=(--data-path "$TRAIN_DATA_PATH")
+fi
+if [[ -n "$VAL_DATA_PATH" ]]; then
+  BASE_ARGS+=(--val-path "$VAL_DATA_PATH")
+fi
+
 SEEDS=(42 42 42 69 420 666 2137)
 TOTAL_RUNS="${#SEEDS[@]}"
 
@@ -73,6 +86,10 @@ TOTAL_RUNS="${#SEEDS[@]}"
   echo "script=$SCRIPT_PATH"
   echo "cache_root=$CACHE_ROOT"
   echo "ckpt_root=$CKPT_ROOT"
+  echo "dataset=$DATASET"
+  echo "train_data_path=${TRAIN_DATA_PATH:-<default>}"
+  echo "val_data_path=${VAL_DATA_PATH:-<default>}"
+  echo "val_frac=$VAL_FRAC"
   echo "base_args=${BASE_ARGS[*]}"
   echo "seeds=${SEEDS[*]}"
   echo

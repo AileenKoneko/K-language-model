@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -37,6 +38,33 @@ def _autocast_context():
     if USE_AMP:
         return torch.amp.autocast(DEVICE, dtype=AMP_DTYPE)
     return nullcontext()
+
+
+def torch_compile_unavailable_reason() -> str | None:
+    if not hasattr(torch, "compile"):
+        return "torch.compile is not available in this PyTorch build."
+    if DEVICE == "cuda" and platform.system() == "Windows":
+        return (
+            "torch.compile on CUDA is disabled on Windows in this project. "
+            "PyTorch's upstream Windows torch.compile/Triton support is still incomplete."
+        )
+    if DEVICE == "cuda" and importlib.util.find_spec("triton") is None:
+        return "torch.compile on CUDA requires Triton, but no Triton installation was found."
+    return None
+
+
+def maybe_enable_compile(model: nn.Module, enabled: bool, mode: str) -> nn.Module:
+    if not enabled:
+        return model
+
+    reason = torch_compile_unavailable_reason()
+    if reason is not None:
+        LOG.warning("Compile disabled | %s", reason)
+        return model
+
+    compiled = torch.compile(model, mode=mode)
+    LOG.info("Compile config | mode=%s", mode)
+    return compiled
 
 
 def setup_logging(verbose: bool = False) -> None:

@@ -6,7 +6,7 @@ import torch
 from .checkpoint import load_model_checkpoint
 from .data import load_dataset
 from .generation import sample_text
-from .model import KStackModel
+from .model import KStackModel, resolve_adaptive_cutoffs
 from .runtime import (
     DEVICE,
     LOG,
@@ -16,20 +16,29 @@ from .runtime import (
     _unwrap_model,
     configure_reproducibility,
     log_runtime_metadata,
+    maybe_enable_compile,
     maybe_write_run_manifest,
     setup_logging,
 )
 from .trainer import TrainConfig, _collect_eval_refine_stats, ce_to_bpc, eval_deterministic, train_model
 
 
+def _parse_adaptive_cutoffs(raw: str | None) -> list[int] | None:
+    if raw is None:
+        return None
+    values = [part.strip() for part in raw.split(",")]
+    parsed = [int(value) for value in values if value]
+    return parsed or None
+
+
 def build_parser(description: str | None = None) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description=description or "Train and evaluate a K-Stack character-level language model."
+        description=description or "Train and evaluate a K-Stack token-level language model."
     )
     p.add_argument(
         "--dataset",
         type=str,
-        choices=["shakespeare", "wikitext2"],
+        choices=["shakespeare", "wikitext2", "wikitext2_raw"],
         default="shakespeare",
         help="Dataset preset to use.",
     )
@@ -51,15 +60,51 @@ def build_parser(description: str | None = None) -> argparse.ArgumentParser:
         default=0.1,
         help="Validation fraction used only when a separate validation file is not available/provided.",
     )
+    p.add_argument(
+        "--tokenizer",
+        type=str,
+        choices=["char", "sentencepiece"],
+        default="char",
+        help="Tokenizer used to build the training and validation sequences.",
+    )
+    p.add_argument(
+        "--sp-model",
+        type=str,
+        default=None,
+        help="SentencePiece model path. If omitted during training, a model is trained into data/tokenizers/.",
+    )
+    p.add_argument("--sp-vocab-size", type=int, default=4096)
+    p.add_argument(
+        "--sp-model-type",
+        type=str,
+        choices=["unigram", "bpe", "char", "word"],
+        default="unigram",
+    )
+    p.add_argument("--sp-character-coverage", type=float, default=1.0)
+    p.add_argument("--sp-split-digits", action="store_true")
+    p.add_argument("--sp-byte-fallback", action="store_true")
     p.add_argument("--steps", type=int, default=25000)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--window", type=int, default=512)
     p.add_argument("--d-model", type=int, default=64)
+    p.add_argument(
+        "--emb-dim",
+        type=int,
+        default=None,
+        help="Optional token embedding dimension. Defaults to --d-model when omitted.",
+    )
     p.add_argument("--rank", type=int, default=32)
     p.add_argument("--n-k2", type=int, default=4)
-    p.add_argument("--head-mode", type=str, choices=["linear", "gelu"], default="linear")
+    p.add_argument("--head-mode", type=str, choices=["linear", "gelu", "adaptive"], default="linear")
     p.add_argument("--head-mult", type=int, default=6)
     p.add_argument("--head-dropout", type=float, default=0.10)
+    p.add_argument(
+        "--adaptive-cutoffs",
+        type=str,
+        default=None,
+        help="Comma-separated class cutoffs for adaptive softmax. If omitted, a heuristic is used from vocab size.",
+    )
+    p.add_argument("--adaptive-div-value", type=float, default=4.0)
     p.add_argument("--emb-dropout", type=float, default=0.08)
     p.add_argument("--mlp-dropout", type=float, default=0.10)
     p.add_argument("--residual-dropout", type=float, default=0.05)
@@ -186,11 +231,13 @@ def build_parser(description: str | None = None) -> argparse.ArgumentParser:
         help="Recent token window for repetition penalty. 0 means full generated context.",
     )
     p.add_argument(
-        "--prompt-lock-chars",
+        "--prompt-lock-tokens",
         type=int,
+        dest="prompt_lock_tokens",
         default=0,
-        help="Keep first N prompt chars in conditioning window during long generation.",
+        help="Keep first N prompt tokens in the conditioning window during long generation.",
     )
+    p.add_argument("--prompt-lock-chars", type=int, dest="prompt_lock_tokens", help=argparse.SUPPRESS)
     p.add_argument("--verbose", action="store_true")
     return p
 
@@ -235,12 +282,32 @@ def main() -> None:
     log_runtime_metadata()
     maybe_write_run_manifest(Path(args.run_manifest) if args.run_manifest else None, args)
 
-    train_data, val_data, vocab_size, stoi, itos = load_dataset(
+    remap_by_frequency = args.head_mode == "adaptive"
+    train_data, val_data, tokenizer = load_dataset(
         dataset=args.dataset,
         val_frac=args.val_frac,
         data_path=args.data_path,
         val_path=args.val_path,
+        tokenizer_type=args.tokenizer,
+        sp_model=args.sp_model,
+        sp_vocab_size=args.sp_vocab_size,
+        sp_model_type=args.sp_model_type,
+        sp_character_coverage=args.sp_character_coverage,
+        sp_split_digits=args.sp_split_digits,
+        sp_byte_fallback=args.sp_byte_fallback,
+        allow_training_tokenizer=True,
+        remap_by_frequency=remap_by_frequency,
     )
+    vocab_size = tokenizer.vocab_size
+    adaptive_cutoffs = None
+    if args.head_mode == "adaptive":
+        adaptive_cutoffs = resolve_adaptive_cutoffs(vocab_size, _parse_adaptive_cutoffs(args.adaptive_cutoffs))
+        LOG.info(
+            "Adaptive head | cutoffs=%s | div_value=%.2f | vocab_frequency_remap=%s",
+            adaptive_cutoffs,
+            args.adaptive_div_value,
+            str(remap_by_frequency).lower(),
+        )
 
     cfg = TrainConfig(
         window=args.window,
@@ -267,13 +334,14 @@ def main() -> None:
         use_fused_adamw=args.fused_adamw,
         eval_interval=args.eval_interval,
         diagnostics=args.diagnostics,
-        report_bpc=(args.dataset == "wikitext2"),
+        report_bpc=(args.dataset in {"wikitext2", "wikitext2_raw"} and tokenizer.is_character_level),
     )
 
     model = KStackModel(
         vocab_size=vocab_size,
         window=cfg.window,
         d=cfg.d_model,
+        emb_dim=args.emb_dim,
         rank=cfg.rank,
         n_k2=cfg.n_k2,
         emb_dropout=cfg.emb_dropout,
@@ -282,6 +350,8 @@ def main() -> None:
         head_mode=args.head_mode,
         head_mult=args.head_mult,
         head_dropout=args.head_dropout,
+        adaptive_cutoffs=adaptive_cutoffs,
+        adaptive_div_value=args.adaptive_div_value,
         refine_steps=args.refine_steps,
         train_refine_steps=args.train_refine_steps,
         alpha_cap=cfg.alpha_cap,
@@ -289,8 +359,7 @@ def main() -> None:
     )
 
     if args.compile:
-        model = torch.compile(model, mode=args.compile_mode)
-        LOG.info("Compile config | mode=%s", args.compile_mode)
+        model = maybe_enable_compile(model, enabled=True, mode=args.compile_mode)
     elif not args.deterministic:
         LOG.warning(
             "Non-deterministic fast mode active: run-to-run CE can drift with AMP/fused/compile behavior. "
@@ -301,14 +370,19 @@ def main() -> None:
     params = model_for_stats.count_params() if hasattr(model_for_stats, "count_params") else {}
     if params:
         LOG.info(
-            "Model params | total=%s | embedding=%s | k_stack=%s | head=%s",
+            "Model params | total=%s | embedding=%s | k_stack=%s | head=%s | other=%s",
             f"{params['total']:,}",
             f"{params['embedding']:,}",
             f"{params['k_stack']:,}",
             f"{params['head']:,}",
+            f"{params['other']:,}",
         )
         LOG.info(
-            "Model config | head_mode=%s | head_mult=%d | head_dropout=%.2f | alpha_cap=%.2f | refine_steps[train/eval]=%d/%d",
+            "Model config | tokenizer=%s | emb_dim=%d | d_model=%d | tied_weights=%s | head_mode=%s | head_mult=%d | head_dropout=%.2f | alpha_cap=%.2f | refine_steps[train/eval]=%d/%d",
+            tokenizer.describe(),
+            model_for_stats.emb_dim,
+            model_for_stats.d_model,
+            str(getattr(model_for_stats, "tie_weights", False)).lower(),
             args.head_mode,
             args.head_mult,
             args.head_dropout,
@@ -316,6 +390,8 @@ def main() -> None:
             model_for_stats.train_refine_steps,
             model_for_stats.refine_steps,
         )
+        if getattr(model_for_stats, "adaptive_cutoffs", []):
+            LOG.info("Adaptive config | cutoffs=%s | div_value=%.2f", model_for_stats.adaptive_cutoffs, model_for_stats.adaptive_div_value)
         if model_for_stats.train_refine_steps == 0:
             LOG.warning("train_refine_steps=0: iterative refinement is disabled during training, so eta is not optimized.")
 
@@ -336,7 +412,7 @@ def main() -> None:
         ce, ppl = eval_deterministic(model, val_data, cfg.window, cfg.batch_size)
         loaded_step_str = "N/A" if loaded_step is None else str(loaded_step)
         loaded_best_ppl_str = "N/A" if loaded_best_ppl is None else f"{loaded_best_ppl:.2f}"
-        if args.dataset == "wikitext2":
+        if cfg.report_bpc:
             LOG.info(
                 "Eval only | step=%s | ckpt_best_ppl=%s | refine_steps=%d | val_bpc=%.4f | val_ppl=%.2f",
                 loaded_step_str,
@@ -363,8 +439,7 @@ def main() -> None:
             top_p = args.top_p if 0.0 < args.top_p < 1.0 else None
             text = sample_text(
                 model,
-                stoi,
-                itos,
+                tokenizer,
                 args.prompt,
                 args.sample_tokens,
                 cfg.window,
@@ -373,7 +448,7 @@ def main() -> None:
                 top_p=top_p,
                 repetition_penalty=max(args.repetition_penalty, 1.0),
                 repetition_window=args.repetition_window,
-                prompt_lock_chars=max(args.prompt_lock_chars, 0),
+                prompt_lock_tokens=max(args.prompt_lock_tokens, 0),
             )
             LOG.info("Sample:\n%s", text)
         return
@@ -386,8 +461,7 @@ def main() -> None:
         top_p = args.top_p if 0.0 < args.top_p < 1.0 else None
         text = sample_text(
             model.to(DEVICE),
-            stoi,
-            itos,
+            tokenizer,
             args.prompt,
             args.sample_tokens,
             cfg.window,
@@ -396,7 +470,7 @@ def main() -> None:
             top_p=top_p,
             repetition_penalty=max(args.repetition_penalty, 1.0),
             repetition_window=args.repetition_window,
-            prompt_lock_chars=max(args.prompt_lock_chars, 0),
+            prompt_lock_tokens=max(args.prompt_lock_tokens, 0),
         )
         LOG.info("Sample:\n%s", text)
 

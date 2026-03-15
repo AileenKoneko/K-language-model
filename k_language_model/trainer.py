@@ -7,7 +7,6 @@ from typing import Dict, List
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import get_batch
@@ -50,8 +49,7 @@ def eval_deterministic(model: nn.Module, data: torch.Tensor, window: int, batch_
 
         with _autocast_context():
             # Use unwrapped model for deterministic eval behavior (historical baseline).
-            logits = core_model(x)
-            loss = F.cross_entropy(logits.reshape(-1, core_model.vocab_size), y.reshape(-1), reduction="sum")
+            loss = core_model(x, targets=y, reduction="sum")
 
         total_loss += loss.item()
         total_count += y.numel()
@@ -143,7 +141,7 @@ def _build_optimizer_param_groups(model: nn.Module, cfg: TrainConfig) -> List[Di
 
         if any(t in name for t in ("decay_logit", "alpha_logit", "k_base_gate_logit", "eta_logit")):
             groups["k_logit"]["params"].append(p)
-        elif name.startswith("emb."):
+        elif name.startswith("emb.") or name.startswith("emb_to_model"):
             groups["emb"]["params"].append(p)
         elif name.endswith(".bias"):
             groups["bias"]["params"].append(p)
@@ -245,7 +243,11 @@ def _collect_update_weight_stats(
     def layer_key(name: str) -> str:
         if name.startswith("emb."):
             return "emb"
+        if name.startswith("emb_to_model"):
+            return "emb"
         if name.startswith("head."):
+            return "head"
+        if name.startswith("head_to_emb"):
             return "head"
         if name.startswith("norm."):
             return "final_norm"
@@ -390,8 +392,7 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
             x, y = get_batch(train_data, cfg.window, cfg.batch_size, DEVICE)
 
             with _autocast_context():
-                logits = model(x)
-                loss = F.cross_entropy(logits.reshape(-1, model.vocab_size), y.reshape(-1))
+                loss = model(x, targets=y)
 
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:

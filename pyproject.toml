@@ -11,12 +11,14 @@ requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
   "numpy>=1.20,<2",
+  "sentencepiece>=0.2",
   "torch>=2.1",
 ]
 
 [project.scripts]
 k-lm-train = "k_language_model.train_app:main"
 k-lm-infer = "k_language_model.infer_app:main"
+k-lm-bench-denoise = "k_language_model.denoise_bench:main"
 
 [tool.setuptools]
 packages = ["k_language_model"]

@@ -1,3 +1,4 @@
 # Core runtime dependencies for k_language_model
 numpy>=1.20,<2
+sentencepiece>=0.2
 torch>=2.1

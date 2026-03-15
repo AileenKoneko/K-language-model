@@ -1,9 +1,12 @@
-# K-Operators: K-Stack Character Language Model
+# K-Operators: K-Stack Language Model
 
-This directory contains a self-contained character-level language model built around a custom K-Stack backbone.  
+This directory contains a self-contained language model built around a custom K-Stack backbone.  
 It supports:
 
 - training on Tiny Shakespeare or WikiText-2,
+- character or SentencePiece tokenization,
+- factorized token embeddings with `--emb-dim`,
+- adaptive softmax output heads for larger vocabularies,
 - deterministic evaluation (cross-entropy/perplexity),
 - checkpoint save/resume/load,
 - text sampling with top-k/top-p/repetition controls,
@@ -13,6 +16,39 @@ It supports:
 Archive: [Zenodo record 19004569](https://zenodo.org/records/19004569)
 
 ## Results
+
+WikiText-2 SentencePiece checkpoint evals (run on March 15, 2026):
+
+- Dataset/tokenizer: `--dataset wikitext2 --tokenizer sentencepiece --sp-model data/tokenizers/wikitext2_unigram_8192.model --sp-vocab-size 8192`
+- Shared head/refinement flags: `--head-mode adaptive --adaptive-cutoffs 1024,4096 --adaptive-div-value 4 --emb-dim 64 --refine-steps 1`
+- Eval note: reevaluated on `cuda` with `decay_impl=block` for lower eval memory. Batch size was `8` for `window=1024` and `32` otherwise.
+
+| Step | Window | d-model | emb-dim | n-k2 | Rank | Params | Val CE | Val PPL |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 20000 | 512 | 128 | 64 | 8 | 32 | 3,790,353 | 3.1059 | 22.33 |
+| 7500 | 512 | 256 | 64 | 6 | 32 | 5,392,077 | 3.1148 | 22.53 |
+| 19750 | 512 | 128 | 64 | 6 | 32 | 3,084,237 | 3.1204 | 22.66 |
+| 19500 | 512 | 128 | 64 | 6 | 32 | 3,084,237 | 3.1344 | 22.97 |
+| 20000 | 1024 | 128 | 64 | 6 | 32 | 7,802,829 | 3.1452 | 23.22 |
+| 17250 | 512 | 128 | 64 | 6 | 32 | 3,084,237 | 3.1458 | 23.24 |
+| 11750 | 512 | 128 | 64 | 6 | 64 | 3,133,581 | 3.1563 | 23.48 |
+| 5500 | 512 | 256 | 64 | 6 | 32 | 5,392,077 | 3.1601 | 23.57 |
+| 14750 | 512 | 128 | 64 | 6 | 32 | 3,084,237 | 3.1622 | 23.62 |
+| 6500 | 512 | 128 | 64 | 6 | 64 | 3,133,581 | 3.2136 | 24.87 |
+| 7500 | 512 | 128 | 64 | 6 | 32 | 3,084,237 | 3.2190 | 25.00 |
+| 5750 | 512 | 128 | 64 | 6 | 32 | 3,084,237 | 3.2565 | 25.96 |
+
+Synthetic denoising benchmark (run on March 15, 2026):
+
+- Script/flags: `python bench_denoise.py --backbone both --steps 500 --deterministic --no-tf32`
+- Task: synthetic motif-and-copy token denoising with loss and accuracy measured only on corrupted positions.
+- Takeaway: the single `K2Layer` beats the single `Conv1d` block on denoising quality at lower parameter count, but `Conv1d` remains faster.
+
+| Mixer | Params | Val CE | Val Acc | tok/s |
+|---|---:|---:|---:|---:|
+| `Conv1d` | 12,528 | 2.7190 | 0.1376 | 324,310 |
+| `K2` | 11,034 | 2.0492 | 0.3526 | 192,995 |
+
 
 Post pre-print update (March 14th 2026):
 
@@ -95,7 +131,7 @@ k_operators/
 │   ├── model.py                  # K-Stack model definition
 │   ├── generation.py             # Text sampling implementation
 │   ├── checkpoint.py             # Save/load logic (model + optimizer)
-│   ├── data.py                   # Dataset download/loading + character tokenization
+│   ├── data.py                   # Dataset download/loading + char/SentencePiece tokenization
 │   └── runtime.py                # Device, AMP, logging, reproducibility
 ├── data/
 │   ├── input.txt                 # Tiny Shakespeare dataset cache
@@ -115,6 +151,7 @@ Minimum runtime dependencies (from imports):
 - Python 3.10+
 - PyTorch
 - NumPy
+- SentencePiece
 
 Example:
 
@@ -136,6 +173,18 @@ Optional editable install (enables `k-lm-train` / `k-lm-infer` console commands)
 ```bash
 pip install -e .
 ```
+
+Synthetic denoising benchmark (single `Conv1d` block vs single `K2Layer`):
+
+```bash
+python bench_denoise.py \
+  --backbone both \
+  --steps 300
+```
+
+This benchmark is intentionally small and synthetic. It generates motif-and-copy token sequences, corrupts spans/tokens, and trains both models to reconstruct the original tokens only at corrupted positions.
+
+The defaults are tuned to be easy enough to learn quickly. To stress longer-range denoising, raise `--period-max`, `--burst-count`, `--burst-max-len`, or `--seq-len`.
 
 ### 2) First training run
 
@@ -191,8 +240,10 @@ python train.py \
 
 ### Useful training flags
 
-- Dataset/input: `--dataset {shakespeare,wikitext2}`, `--data-path`, `--val-path`, `--val-frac`
-- Model shape: `--window`, `--d-model`, `--rank`, `--n-k2`, `--head-mode`, `--head-mult`
+- Dataset/input: `--dataset {shakespeare,wikitext2,wikitext2_raw}`, `--data-path`, `--val-path`, `--val-frac`, `--tokenizer`
+- SentencePiece: `--sp-model`, `--sp-vocab-size`, `--sp-model-type`, `--sp-character-coverage`, `--sp-split-digits`, `--sp-byte-fallback`
+- Model shape: `--window`, `--d-model`, `--emb-dim`, `--rank`, `--n-k2`, `--head-mode`, `--head-mult`
+- Adaptive head: `--adaptive-cutoffs`, `--adaptive-div-value`
 - Refinement behavior: `--refine-steps`, `--train-refine-steps`, `--alpha-cap`, `--decay-impl`
 - Optimization: `--lr`, `--lr-floor`, `--warmup-steps`, `--weight-decay`, `--optimizer-mode`
 - Regularization: `--emb-dropout`, `--mlp-dropout`, `--residual-dropout`, `--head-dropout`
@@ -217,6 +268,46 @@ python train.py \
   --refine-steps 1 \
   --ckpt models/wiki_text2.pt
 ```
+
+Raw WikiText-2 preset (uses `wiki.train.raw` / `wiki.valid.raw` and avoids the literal `<unk>` artifacts present in the processed split):
+
+```bash
+python train.py \
+  --dataset wikitext2_raw \
+  --steps 3500 \
+  --window 256 \
+  --d-model 128 \
+  --n-k2 6 \
+  --rank 32 \
+  --head-mode gelu \
+  --head-mult 1 \
+  --refine-steps 1 \
+  --ckpt models/wiki_text2_raw.pt
+```
+
+SentencePiece + adaptive softmax preset:
+
+```bash
+python train.py \
+  --dataset wikitext2 \
+  --tokenizer sentencepiece \
+  --sp-model data/tokenizers/wikitext2_unigram_8192.model \
+  --sp-vocab-size 8192 \
+  --window 256 \
+  --d-model 256 \
+  --emb-dim 64 \
+  --n-k2 6 \
+  --rank 32 \
+  --head-mode adaptive \
+  --adaptive-cutoffs 1024,4096 \
+  --refine-steps 1 \
+  --ckpt models/wiki_text2_sp_adaptive.pt
+```
+
+Notes:
+
+- If `--sp-model` does not exist during training, it is trained automatically from the training split and written under `data/tokenizers/`.
+- When `--head-mode adaptive` is enabled, token ids are remapped by train-set frequency so the adaptive shortlist receives the most common tokens first.
 
 Custom text files:
 
@@ -268,22 +359,22 @@ python infer.py \
 
 Important: dataset + tokenizer context must match the checkpoint.
 
-- Architecture arguments (`--window`, `--d-model`, `--rank`, `--n-k2`, head/refinement flags) must match.
-- Dataset arguments (`--dataset`, `--data-path`, `--val-path`, `--val-frac`) should match what was used when training the checkpoint.
-- Reporting mode: WikiText-2 logs use BPC (`train_bpc` / `val_bpc`), while Shakespeare logs keep CE (`train_ce` / `val_ce`).
+- Architecture arguments (`--window`, `--d-model`, `--emb-dim`, `--rank`, `--n-k2`, head/refinement flags) must match.
+- Dataset/tokenizer arguments (`--dataset`, `--data-path`, `--val-path`, `--val-frac`, `--tokenizer`, SentencePiece flags) should match what was used when training the checkpoint.
+- Reporting mode: WikiText-2 logs use BPC only for char-tokenized runs. SentencePiece runs report token CE and token PPL.
 
 ## Sampling Controls
 
 Both training (`--sample`) and inference support the same generation controls:
 
 - `--prompt`: seed text
-- `--sample-tokens`: number of generated chars
+- `--sample-tokens`: number of generated tokens
 - `--temperature`: logits temperature (lower = more deterministic)
 - `--top-k`: keep top-k logits (0 disables)
 - `--top-p`: nucleus sampling threshold in `(0, 1)` (0 disables)
 - `--repetition-penalty`: >1 discourages repeated tokens
 - `--repetition-window`: lookback window for repetition penalty (`0` = full context)
-- `--prompt-lock-chars`: keep first N prompt chars in long-context conditioning
+- `--prompt-lock-tokens`: keep first N prompt tokens in long-context conditioning
 
 ## Model Architecture
 
@@ -291,7 +382,7 @@ The model is defined in `k_language_model/model.py`.
 
 High-level structure:
 
-1. Character embedding
+1. Token embedding (`--emb-dim` can be smaller than `--d-model`)
 2. K-Stack backbone:
    - `K1` block
    - `n_k2` x `K2` blocks
@@ -299,8 +390,9 @@ High-level structure:
    - `K0` block
 3. Final RMSNorm
 4. Output head:
-   - `linear` head (tied embedding weights), or
-   - `gelu` MLP head
+   - `linear` head (tied embedding weights, optionally through a projection when `--emb-dim != --d-model`),
+   - `gelu` MLP head, or
+   - `adaptive` softmax head for larger vocabularies
 
 ### K2 block summary
 
@@ -392,22 +484,25 @@ python infer.py --help
 ### `train.py` (selected high-impact args)
 
 - Core: `--steps`, `--batch-size`, `--eval-interval`, `--ckpt`
-- Dataset: `--dataset`, `--data-path`, `--val-path`, `--val-frac`
-- Model: `--window`, `--d-model`, `--rank`, `--n-k2`, `--head-mode`, `--head-mult`, `--head-dropout`
+- Dataset: `--dataset`, `--data-path`, `--val-path`, `--val-frac`, `--tokenizer`
+- SentencePiece: `--sp-model`, `--sp-vocab-size`, `--sp-model-type`, `--sp-character-coverage`, `--sp-split-digits`, `--sp-byte-fallback`
+- Model: `--window`, `--d-model`, `--emb-dim`, `--rank`, `--n-k2`, `--head-mode`, `--head-mult`, `--head-dropout`
+- Adaptive: `--adaptive-cutoffs`, `--adaptive-div-value`
 - Refinement/decay: `--refine-steps`, `--train-refine-steps`, `--alpha-cap`, `--decay-impl`
 - Optimizer/schedule: `--lr`, `--lr-floor`, `--warmup-steps`, `--beta1`, `--beta2`, `--weight-decay`, `--optimizer-mode`
 - Perf: `--fused-adamw` / `--no-fused-adamw`, `--compile`, `--compile-mode`
 - Repro: `--seed`, `--deterministic`, `--deterministic-warn-only`, `--no-tf32`, `--strict-repro`, `--run-manifest`
 - Eval-only path: `--eval-only`, `--eval-refine-steps`
-- Sampling: `--sample`, `--prompt`, `--sample-tokens`, `--temperature`, `--top-k`, `--top-p`, `--repetition-penalty`, `--repetition-window`, `--prompt-lock-chars`
+- Sampling: `--sample`, `--prompt`, `--sample-tokens`, `--temperature`, `--top-k`, `--top-p`, `--repetition-penalty`, `--repetition-window`, `--prompt-lock-tokens`
 
 ### `infer.py` (selected high-impact args)
 
 - Required: `--ckpt`
-- Dataset: `--dataset`, `--data-path`, `--val-path`, `--val-frac`
+- Dataset: `--dataset`, `--data-path`, `--val-path`, `--val-frac`, `--tokenizer`
+- SentencePiece: `--sp-model`, `--sp-vocab-size`, `--sp-model-type`, `--sp-character-coverage`, `--sp-split-digits`, `--sp-byte-fallback`
 - Eval: `--batch-size`, `--skip-eval`
-- Sampling: `--skip-sample`, `--prompt`, `--sample-tokens`, `--temperature`, `--top-k`, `--top-p`, `--repetition-penalty`, `--repetition-window`, `--prompt-lock-chars`
-- Architecture compatibility: `--window`, `--d-model`, `--rank`, `--n-k2`, `--head-*`, `--refine-steps`, `--train-refine-steps`, `--eval-refine-steps`, `--alpha-cap`, `--decay-impl`
+- Sampling: `--skip-sample`, `--prompt`, `--sample-tokens`, `--temperature`, `--top-k`, `--top-p`, `--repetition-penalty`, `--repetition-window`, `--prompt-lock-tokens`
+- Architecture compatibility: `--window`, `--d-model`, `--emb-dim`, `--rank`, `--n-k2`, `--head-*`, `--adaptive-*`, `--refine-steps`, `--train-refine-steps`, `--eval-refine-steps`, `--alpha-cap`, `--decay-impl`
 - Runtime/repro: `--compile`, `--compile-mode`, `--seed`, `--deterministic`, `--strict-repro`
 
 ## Troubleshooting
@@ -419,6 +514,7 @@ Reduce one or more of:
 - `--batch-size`
 - `--window`
 - `--d-model`
+- `--emb-dim`
 - `--n-k2`
 
 If needed, switch decay backend to lower-memory mode:
@@ -427,12 +523,19 @@ If needed, switch decay backend to lower-memory mode:
 --decay-impl block
 ```
 
+### `torch.compile` fails with `TritonMissing`
+
+On Windows CUDA setups, `torch.compile` may be unavailable because there is no working Triton package for the environment. The CLI now warns and falls back to eager mode instead of crashing.
+
+If you want the old behavior explicitly, just omit `--compile`.
+
 ### Checkpoint loads with many missing/unexpected keys
 
 Most likely architecture mismatch. Ensure the checkpoint is loaded with the same:
 
-- `window`, `d-model`, `rank`, `n-k2`
-- head mode/mult/dropout
+- `window`, `d-model`, `emb-dim`, `rank`, `n-k2`
+- tokenizer settings, especially SentencePiece model path and vocab size
+- head mode/mult/dropout and adaptive cutoff settings when applicable
 - refine/decode related flags as required for shape compatibility
 - dataset and text sources (`--dataset`, `--data-path`, `--val-path`, `--val-frac`) to keep vocab consistent
 

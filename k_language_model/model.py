@@ -234,14 +234,39 @@ class KStack(nn.Module):
         return h
 
 
+def resolve_adaptive_cutoffs(vocab_size: int, cutoffs: List[int] | None = None) -> List[int]:
+    if vocab_size <= 1:
+        raise ValueError(f"Adaptive softmax requires vocab_size > 1, got {vocab_size}.")
+
+    if cutoffs is None:
+        if vocab_size < 1024:
+            raise ValueError(
+                "Adaptive softmax is not useful for very small vocabularies. "
+                "Use a larger tokenizer vocab or provide explicit --adaptive-cutoffs."
+            )
+        if vocab_size <= 4096:
+            proposed = [max(256, vocab_size // 4), max(768, (3 * vocab_size) // 4)]
+        elif vocab_size <= 16384:
+            proposed = [2000, max(4000, vocab_size // 2)]
+        else:
+            proposed = [2000, 10000, max(20000, (3 * vocab_size) // 4)]
+        cutoffs = proposed
+
+    normalized = sorted({int(cutoff) for cutoff in cutoffs if 0 < int(cutoff) < vocab_size})
+    if not normalized:
+        raise ValueError(f"Adaptive softmax cutoffs must be within (0, vocab_size). Got {cutoffs} for vocab={vocab_size}.")
+    return normalized
+
+
 class KStackModel(nn.Module):
-    """Character-level language model with iterative K-Stack refinement."""
+    """Token-level language model with iterative K-Stack refinement."""
 
     def __init__(
         self,
         vocab_size: int,
         window: int,
         d: int,
+        emb_dim: int | None,
         rank: int,
         n_k2: int,
         emb_dropout: float,
@@ -250,6 +275,8 @@ class KStackModel(nn.Module):
         head_mode: str = "linear",
         head_mult: int = 6,
         head_dropout: float = 0.0,
+        adaptive_cutoffs: List[int] | None = None,
+        adaptive_div_value: float = 4.0,
         refine_steps: int = 8,
         train_refine_steps: int | None = None,
         alpha_cap: float = 1.0,
@@ -257,10 +284,13 @@ class KStackModel(nn.Module):
     ):
         super().__init__()
         self.vocab_size = vocab_size
+        self.d_model = d
+        self.emb_dim = d if emb_dim is None else max(int(emb_dim), 1)
         self.head_mode = head_mode
         self.head_mult = head_mult
 
-        self.emb = nn.Embedding(vocab_size, d)
+        self.emb = nn.Embedding(vocab_size, self.emb_dim)
+        self.emb_to_model = nn.Identity() if self.emb_dim == d else nn.Linear(self.emb_dim, d, bias=False)
         self.emb_drop = nn.Dropout(emb_dropout)
         self.k_stack = KStack(
             window,
@@ -273,9 +303,16 @@ class KStackModel(nn.Module):
             decay_impl=decay_impl,
         )
         self.norm = RMSNorm(d)
+        self.head_to_emb = nn.Identity()
+        self.tie_weights = False
+        self.adaptive_cutoffs = resolve_adaptive_cutoffs(vocab_size, adaptive_cutoffs) if head_mode == "adaptive" else []
+        self.adaptive_div_value = float(adaptive_div_value)
         if head_mode == "linear":
-            self.head = nn.Linear(d, vocab_size, bias=False)
+            if self.emb_dim != d:
+                self.head_to_emb = nn.Linear(d, self.emb_dim, bias=False)
+            self.head = nn.Linear(self.emb_dim, vocab_size, bias=False)
             self.head.weight = self.emb.weight
+            self.tie_weights = True
             self.head_drop = nn.Identity()
         elif head_mode == "gelu":
             hidden = max(d, head_mult * d)
@@ -284,6 +321,15 @@ class KStackModel(nn.Module):
                 nn.Linear(d, hidden),
                 nn.GELU(),
                 nn.Linear(hidden, vocab_size, bias=False),
+            )
+            self.head_drop = nn.Dropout(head_dropout) if head_dropout > 0 else nn.Identity()
+        elif head_mode == "adaptive":
+            self.head = nn.AdaptiveLogSoftmaxWithLoss(
+                in_features=d,
+                n_classes=vocab_size,
+                cutoffs=self.adaptive_cutoffs,
+                div_value=self.adaptive_div_value,
+                head_bias=False,
             )
             self.head_drop = nn.Dropout(head_dropout) if head_dropout > 0 else nn.Identity()
         else:
@@ -331,8 +377,10 @@ class KStackModel(nn.Module):
         means = [v / self._eval_refine_batches for v in self._eval_refine_delta_sums]
         return {"eta": eta_value, "delta_mean": means, "batches": self._eval_refine_batches}
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.emb_drop(self.emb(x))
+    def _forward_hidden(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.emb(x)
+        h = self.emb_to_model(h)
+        h = self.emb_drop(h)
         steps = self.train_refine_steps if self.training else self.refine_steps
         if steps == 0:
             # Disable iterative refinement: run one plain feedforward pass.
@@ -351,6 +399,11 @@ class KStackModel(nn.Module):
             if eval_loop_deltas is not None:
                 self._record_eval_refine_diagnostics(eval_loop_deltas)
         h = self.norm(h)
+        return h
+
+    def _dense_scores_from_hidden(self, h: torch.Tensor) -> torch.Tensor:
+        if self.head_mode == "linear":
+            return self.head(self.head_to_emb(h))
 
         if self.head_mode == "gelu":
             h = self.head[0](h)
@@ -359,7 +412,37 @@ class KStackModel(nn.Module):
             h = self.head_drop(h)
             return self.head[3](h)
 
-        return self.head(h)
+        if self.head_mode == "adaptive":
+            head_in = self.head_drop(h).reshape(-1, h.size(-1))
+            return self.head.log_prob(head_in).view(h.size(0), h.size(1), self.vocab_size)
+
+        raise RuntimeError(f"Unsupported head_mode: {self.head_mode}")
+
+    def _loss_from_hidden(self, h: torch.Tensor, targets: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+        if reduction not in {"mean", "sum"}:
+            raise ValueError(f"Unsupported reduction: {reduction}")
+
+        flat_targets = targets.reshape(-1)
+        if self.head_mode == "adaptive":
+            head_in = self.head_drop(h).reshape(-1, h.size(-1))
+            out = self.head(head_in, flat_targets)
+            if reduction == "mean":
+                return out.loss
+            return out.loss * flat_targets.numel()
+
+        scores = self._dense_scores_from_hidden(h)
+        return F.cross_entropy(scores.reshape(-1, self.vocab_size), flat_targets, reduction=reduction)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        reduction: str = "mean",
+    ) -> torch.Tensor:
+        h = self._forward_hidden(x)
+        if targets is not None:
+            return self._loss_from_hidden(h, targets, reduction=reduction)
+        return self._dense_scores_from_hidden(h)
 
     def count_params(self) -> Dict[str, int]:
         def _count_unique(params, skip_ptrs: set[int] | None = None) -> tuple[int, set[int]]:
@@ -375,8 +458,12 @@ class KStackModel(nn.Module):
                 total_count += p.numel()
             return total_count, seen
 
-        emb, emb_ptrs = _count_unique(self.emb.parameters())
+        emb_params = list(self.emb.parameters()) + list(self.emb_to_model.parameters())
+        head_params = list(self.head.parameters()) + list(self.head_to_emb.parameters())
+
+        emb, emb_ptrs = _count_unique(emb_params)
         stack, emb_stack_ptrs = _count_unique(self.k_stack.parameters(), skip_ptrs=emb_ptrs)
-        head, _ = _count_unique(self.head.parameters(), skip_ptrs=emb_stack_ptrs)
+        head, head_ptrs = _count_unique(head_params, skip_ptrs=emb_stack_ptrs)
         total, _ = _count_unique(self.parameters())
-        return {"total": total, "embedding": emb, "k_stack": stack, "head": head}
+        other, _ = _count_unique(self.parameters(), skip_ptrs=head_ptrs)
+        return {"total": total, "embedding": emb, "k_stack": stack, "head": head, "other": other}

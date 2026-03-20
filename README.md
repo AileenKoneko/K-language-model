@@ -13,9 +13,49 @@ It supports:
 - optional `torch.compile`,
 - strict reproducibility mode.
 
-Archive: [Zenodo record 19004569](https://zenodo.org/records/19004569)
+Archive: [K-Operators: A Linear-Time Sequence Mixer
+with Learned Decayed Positional Kernels](https://zenodo.org/records/19136398)
+
+Archive: [Kernels might be what you need](https://zenodo.org/records/19004569)
 
 ## Results
+
+### Paper v2 ablations (March 2026)
+
+Source: `k_operators_paper_v2.tex` (March 2026 revision).
+
+- Recommended config from ablations: enable `K_base`, use uncapped gamma (`0.15 <= gamma <= 0.995`), disable refinement (`--refine-steps 0`).
+
+WikiText-2 ablation (SentencePiece vocab 8192, 25K steps, `d-model=256`, `rank=32`, `window=512`):
+
+| Configuration | K_base | Shared K_base | Params | Val PPL |
+|---|:---:|:---:|---:|---:|
+| Full (shared K_base, 5 seeds) | yes | yes | 4.08M | **19.99 ± 0.09** |
+| Full (per-layer K_base) | yes | no | 5.39M | 19.89 |
+| No K_base (`d=256`) | no | no | 3.82M | 20.59 |
+| No K_base (`d=304`, capacity control) | no | no | ~5.4M | 20.99 |
+| Original (capped `gamma >= 0.85`, with refinement) | yes | no | 3.79M | 22.33 |
+
+Tiny Shakespeare ablation (character-level vocab 65, `d-model=128`, `rank=32`, `window=256`):
+
+| K_base | Refinement | Gamma range | Val PPL | Notes |
+|:---:|:---:|:---:|---:|---|
+| yes | no | uncapped (`gamma >= 0.15`) | **4.55** | Best configuration |
+| yes | no | capped (`gamma >= 0.85`) | 4.67 |  |
+| no | no | uncapped (`gamma >= 0.15`) | 4.78 |  |
+| no | yes | uncapped (`gamma >= 0.15`) | 4.73 |  |
+| yes | yes | capped (`gamma >= 0.85`) | 4.74 | Original configuration |
+
+Component effects from the paper (positive is better):
+
+| Component | WikiText-2 ΔPPL | Tiny Shakespeare ΔPPL |
+|---|---:|---:|
+| Gamma uncapping (`0.15 <= gamma`) | +2.44 | +0.12 |
+| Add `K_base` (vs equal-capacity no-`K_base`) | +1.00 | +0.23 |
+| Share `K_base` (vs per-layer) | -0.10 | n/a |
+| Enable refinement (`eta > 0`) | -0.3 to -0.5 | -0.06 to -0.19 |
+
+### Historical checkpoint evals (March 13-15, 2026)
 
 WikiText-2 SentencePiece checkpoint evals (run on March 15, 2026):
 
@@ -242,7 +282,7 @@ python train.py \
 
 - Dataset/input: `--dataset {shakespeare,wikitext2,wikitext2_raw}`, `--data-path`, `--val-path`, `--val-frac`, `--tokenizer`
 - SentencePiece: `--sp-model`, `--sp-vocab-size`, `--sp-model-type`, `--sp-character-coverage`, `--sp-split-digits`, `--sp-byte-fallback`
-- Model shape: `--window`, `--d-model`, `--emb-dim`, `--rank`, `--n-k2`, `--head-mode`, `--head-mult`
+- Model shape: `--window`, `--d-model`, `--emb-dim`, `--rank`, `--k-base-rank`, `--k-base-impl`, `--share-k-base`/`--no-share-k-base`, `--n-k2`, `--head-mode`, `--head-mult`
 - Adaptive head: `--adaptive-cutoffs`, `--adaptive-div-value`
 - Refinement behavior: `--refine-steps`, `--train-refine-steps`, `--alpha-cap`, `--decay-impl`
 - Optimization: `--lr`, `--lr-floor`, `--warmup-steps`, `--weight-decay`, `--optimizer-mode`
@@ -359,7 +399,7 @@ python infer.py \
 
 Important: dataset + tokenizer context must match the checkpoint.
 
-- Architecture arguments (`--window`, `--d-model`, `--emb-dim`, `--rank`, `--n-k2`, head/refinement flags) must match.
+- Architecture arguments (`--window`, `--d-model`, `--emb-dim`, `--rank`, `--k-base-rank`, `--k-base-impl`, `--share-k-base`/`--no-share-k-base`, `--n-k2`, head/refinement flags) must match.
 - Dataset/tokenizer arguments (`--dataset`, `--data-path`, `--val-path`, `--val-frac`, `--tokenizer`, SentencePiece flags) should match what was used when training the checkpoint.
 - Reporting mode: WikiText-2 logs use BPC only for char-tokenized runs. SentencePiece runs report token CE and token PPL.
 
@@ -401,10 +441,17 @@ Each K2 layer mixes sequence information with two components:
 - learned causal base kernel (`k_base`),
 - low-rank decayed recurrent interaction (`u`, `v`, `decay_logit`, `alpha_logit`).
 
-Two decay implementations are available:
+Three decay implementations are available:
 
 - `mask` (default): fastest, more memory-heavy
 - `block`: lower memory, uses blocked scan
+- `kernel`: experimental Triton CUDA backend (falls back to `block` when unsupported)
+
+Low-rank `k_base` execution modes (`--k-base-impl`):
+
+- `auto` (default): chooses fused path on CUDA when temporary tensor size is safe, otherwise uses scan
+- `fused`: force fused path (typically fastest on CUDA, higher temporary memory)
+- `scan`: force scan path (lowest temporary memory; typical choice for CPU/MPS)
 
 ### Iterative refinement
 
@@ -481,12 +528,30 @@ python train.py --help
 python infer.py --help
 ```
 
+### Mode reference (all mode-valued flags)
+
+| Flag | Choices | Default | Scope |
+|---|---|---|---|
+| `--dataset` | `shakespeare`, `wikitext2`, `wikitext2_raw` | `shakespeare` | train + infer |
+| `--tokenizer` | `char`, `sentencepiece` | `char` | train + infer |
+| `--sp-model-type` | `unigram`, `bpe`, `char`, `word` | `unigram` | train + infer |
+| `--head-mode` | `linear`, `gelu`, `adaptive` | `linear` | train + infer |
+| `--k-base-impl` | `auto`, `fused`, `scan` | `auto` | train + infer |
+| `--decay-impl` | `mask`, `block`, `kernel` | `mask` | train + infer |
+| `--optimizer-mode` | `simple`, `grouped` | `grouped` | train only |
+| `--compile-mode` | `default`, `reduce-overhead`, `max-autotune` | `default` | train + infer |
+
+Notes:
+
+- `--optimizer-mode grouped` uses specialized param groups (`core`, `bias`, `norm`, `emb`, `k_logit`) with per-group LR multipliers; `simple` uses standard `decay`/`no_decay` grouping.
+- `--decay-impl kernel` is CUDA/Triton-oriented and falls back to `block` if unavailable.
+
 ### `train.py` (selected high-impact args)
 
 - Core: `--steps`, `--batch-size`, `--eval-interval`, `--ckpt`
 - Dataset: `--dataset`, `--data-path`, `--val-path`, `--val-frac`, `--tokenizer`
 - SentencePiece: `--sp-model`, `--sp-vocab-size`, `--sp-model-type`, `--sp-character-coverage`, `--sp-split-digits`, `--sp-byte-fallback`
-- Model: `--window`, `--d-model`, `--emb-dim`, `--rank`, `--n-k2`, `--head-mode`, `--head-mult`, `--head-dropout`
+- Model: `--window`, `--d-model`, `--emb-dim`, `--rank`, `--k-base-rank`, `--k-base-impl`, `--share-k-base`/`--no-share-k-base`, `--n-k2`, `--head-mode`, `--head-mult`, `--head-dropout`
 - Adaptive: `--adaptive-cutoffs`, `--adaptive-div-value`
 - Refinement/decay: `--refine-steps`, `--train-refine-steps`, `--alpha-cap`, `--decay-impl`
 - Optimizer/schedule: `--lr`, `--lr-floor`, `--warmup-steps`, `--beta1`, `--beta2`, `--weight-decay`, `--optimizer-mode`
@@ -502,7 +567,7 @@ python infer.py --help
 - SentencePiece: `--sp-model`, `--sp-vocab-size`, `--sp-model-type`, `--sp-character-coverage`, `--sp-split-digits`, `--sp-byte-fallback`
 - Eval: `--batch-size`, `--skip-eval`
 - Sampling: `--skip-sample`, `--prompt`, `--sample-tokens`, `--temperature`, `--top-k`, `--top-p`, `--repetition-penalty`, `--repetition-window`, `--prompt-lock-tokens`
-- Architecture compatibility: `--window`, `--d-model`, `--emb-dim`, `--rank`, `--n-k2`, `--head-*`, `--adaptive-*`, `--refine-steps`, `--train-refine-steps`, `--eval-refine-steps`, `--alpha-cap`, `--decay-impl`
+- Architecture compatibility: `--window`, `--d-model`, `--emb-dim`, `--rank`, `--k-base-rank`, `--k-base-impl`, `--share-k-base`/`--no-share-k-base`, `--n-k2`, `--head-*`, `--adaptive-*`, `--refine-steps`, `--train-refine-steps`, `--eval-refine-steps`, `--alpha-cap`, `--decay-impl`
 - Runtime/repro: `--compile`, `--compile-mode`, `--seed`, `--deterministic`, `--strict-repro`
 
 ## Troubleshooting

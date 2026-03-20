@@ -99,6 +99,32 @@ def parse_args() -> argparse.Namespace:
         help="Optional token embedding dimension used by the checkpoint.",
     )
     p.add_argument("--rank", type=int, default=32)
+    p.add_argument(
+        "--k-base-rank",
+        type=int,
+        default=2,
+        help="Low-rank factorization rank for causal k_base path. Set <=0 to use dense k_base.",
+    )
+    p.add_argument(
+        "--k-base-impl",
+        type=str,
+        choices=["auto", "fused", "scan"],
+        default="auto",
+        help="Low-rank k_base kernel: auto picks fused on accelerators when temporary tensors fit; scan minimizes memory.",
+    )
+    p.add_argument(
+        "--share-k-base",
+        dest="share_k_base",
+        action="store_true",
+        help="Use one shared dense learnable k_base matrix across all K2 layers (requires --k-base-rank <= 0).",
+    )
+    p.add_argument(
+        "--no-share-k-base",
+        dest="share_k_base",
+        action="store_false",
+        help="Use per-layer dense k_base matrices when --k-base-rank <= 0.",
+    )
+    p.set_defaults(share_k_base=False)
     p.add_argument("--n-k2", type=int, default=4)
     p.add_argument("--head-mode", type=str, choices=["linear", "gelu", "adaptive"], default="linear")
     p.add_argument("--head-mult", type=int, default=6)
@@ -132,10 +158,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--decay-impl",
         type=str,
-        choices=["mask", "block"],
+        choices=["mask", "block", "kernel"],
         default="mask",
-        help="Gamma-decay backend used by the checkpoint architecture.",
+        help="Gamma-decay backend used by the checkpoint architecture (kernel is experimental Triton CUDA path).",
     )
+    p.add_argument("--gamma-min", type=float, default=0.85, help="Lower bound for per-rank gamma decay values.")
+    p.add_argument("--gamma-max", type=float, default=1.0, help="Upper bound for per-rank gamma decay values.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--deterministic",
@@ -252,6 +280,9 @@ def main() -> None:
         emb_dim=args.emb_dim,
         rank=args.rank,
         n_k2=args.n_k2,
+        k_base_rank=args.k_base_rank,
+        k_base_impl=args.k_base_impl,
+        share_k_base=args.share_k_base,
         emb_dropout=0.0,
         mlp_dropout=0.0,
         residual_dropout=0.0,
@@ -263,6 +294,8 @@ def main() -> None:
         refine_steps=args.refine_steps,
         train_refine_steps=args.train_refine_steps,
         alpha_cap=args.alpha_cap,
+        gamma_min=args.gamma_min,
+        gamma_max=args.gamma_max,
         decay_impl=args.decay_impl,
     )
 
@@ -288,12 +321,17 @@ def main() -> None:
             f"{params['other']:,}",
         )
         LOG.info(
-            "Model config | tokenizer=%s | emb_dim=%d | d_model=%d | tied_weights=%s | head_mode=%s",
+            "Model config | tokenizer=%s | emb_dim=%d | d_model=%d | tied_weights=%s | head_mode=%s | k_base_rank=%d | k_base_impl=%s | share_k_base=%s | gamma[min/max]=%.3f/%.3f",
             tokenizer.describe(),
             core_model.emb_dim,
             core_model.d_model,
             str(getattr(core_model, "tie_weights", False)).lower(),
             args.head_mode,
+            core_model.k_base_rank,
+            core_model.k_base_impl,
+            str(getattr(core_model, "share_k_base", False)).lower(),
+            args.gamma_min,
+            args.gamma_max,
         )
         if getattr(core_model, "adaptive_cutoffs", []):
             LOG.info("Adaptive config | cutoffs=%s | div_value=%.2f", core_model.adaptive_cutoffs, core_model.adaptive_div_value)

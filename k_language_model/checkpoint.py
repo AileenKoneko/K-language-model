@@ -105,6 +105,20 @@ def _extract_checkpoint_model_state(ck: object) -> Tuple[Dict[str, torch.Tensor]
     return _normalize_state_dict_keys(raw_state), step, best_ppl
 
 
+def _maybe_prepare_state_dict_for_model(model: nn.Module, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    prepare_fn = getattr(model, "prepare_state_dict_for_load", None)
+    if not callable(prepare_fn):
+        return state
+    try:
+        prepared = prepare_fn(state)
+    except Exception as exc:
+        LOG.warning("State-dict adaptation hook failed (%s). Continuing with raw checkpoint state.", exc)
+        return state
+    if isinstance(prepared, dict):
+        return prepared
+    return state
+
+
 def _log_state_load_mismatch(missing_keys: List[str], unexpected_keys: List[str]) -> None:
     if missing_keys:
         preview = ", ".join(missing_keys[:8])
@@ -116,14 +130,37 @@ def _log_state_load_mismatch(missing_keys: List[str], unexpected_keys: List[str]
         LOG.warning("Checkpoint unexpected keys (%d): %s%s", len(unexpected_keys), preview, suffix)
 
 
+def _maybe_bootstrap_low_rank_k_base(model: nn.Module, missing_keys: List[str]) -> bool:
+    if not missing_keys:
+        return False
+    needs_bootstrap = any(key.endswith("w_k1.weight") or key.endswith("w_k2.weight") for key in missing_keys)
+    if not needs_bootstrap:
+        return False
+    bootstrap_fn = getattr(model, "bootstrap_low_rank_k_base", None)
+    if callable(bootstrap_fn):
+        bootstrap_fn()
+        return True
+    return False
+
+
+def _filter_bootstrapped_low_rank_missing_keys(missing_keys: List[str]) -> List[str]:
+    return [key for key in missing_keys if not (key.endswith("w_k1.weight") or key.endswith("w_k2.weight"))]
+
+
 def load_model_checkpoint(path: Path, model: nn.Module) -> Tuple[int | None, float | None]:
     # This repository stores full training snapshots (not just tensors), so weights_only=False is intentional.
     # Do not load untrusted checkpoints.
     ck = torch.load(path, map_location=DEVICE, weights_only=False)
     state, step, best_ppl = _extract_checkpoint_model_state(ck)
     core_model = _unwrap_model(model)
+    state = _maybe_prepare_state_dict_for_model(core_model, state)
     incompatible = core_model.load_state_dict(state, strict=False)
-    _log_state_load_mismatch(list(incompatible.missing_keys), list(incompatible.unexpected_keys))
+    missing_keys = list(incompatible.missing_keys)
+    unexpected_keys = list(incompatible.unexpected_keys)
+    if _maybe_bootstrap_low_rank_k_base(core_model, missing_keys):
+        LOG.info("Bootstrapped low-rank k_base factors from loaded dense k_base buffers.")
+        missing_keys = _filter_bootstrapped_low_rank_missing_keys(missing_keys)
+    _log_state_load_mismatch(missing_keys, unexpected_keys)
     step_str = "N/A" if step is None else str(step)
     best_str = "N/A" if best_ppl is None else f"{best_ppl:.3f}"
     LOG.info("Model checkpoint loaded | step=%s | best_ppl=%s | path=%s", step_str, best_str, path)
@@ -136,8 +173,14 @@ def load_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimiz
     ck = torch.load(path, map_location=DEVICE, weights_only=False)
     state, step, best_ppl = _extract_checkpoint_model_state(ck)
     core_model = _unwrap_model(model)
+    state = _maybe_prepare_state_dict_for_model(core_model, state)
     incompatible = core_model.load_state_dict(state, strict=False)
-    _log_state_load_mismatch(list(incompatible.missing_keys), list(incompatible.unexpected_keys))
+    missing_keys = list(incompatible.missing_keys)
+    unexpected_keys = list(incompatible.unexpected_keys)
+    if _maybe_bootstrap_low_rank_k_base(core_model, missing_keys):
+        LOG.info("Bootstrapped low-rank k_base factors from loaded dense k_base buffers.")
+        missing_keys = _filter_bootstrapped_low_rank_missing_keys(missing_keys)
+    _log_state_load_mismatch(missing_keys, unexpected_keys)
 
     optimizer_loaded = False
     if isinstance(ck, dict) and "optimizer" in ck:

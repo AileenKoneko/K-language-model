@@ -11,7 +11,7 @@ import torch.nn as nn
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import get_batch
 from .model import KStackModel
-from .runtime import DEVICE, GAMMA_FLOOR, LOG, USE_AMP, _autocast_context, _unwrap_model
+from .runtime import DEVICE, LOG, USE_AMP, _autocast_context, _unwrap_model
 
 
 def ce_to_bpc(ce: float) -> float:
@@ -197,7 +197,9 @@ def _collect_k_layer_stats(model: nn.Module) -> str:
             alpha_cap = float(getattr(layer, "alpha_cap", 1.0))
             alphas.append((alpha_cap * torch.sigmoid(layer.alpha_logit)).item())
         if hasattr(layer, "decay_logit"):
-            gamma = GAMMA_FLOOR + (1.0 - GAMMA_FLOOR) * torch.sigmoid(layer.decay_logit)
+            gamma_min = float(getattr(layer, "gamma_min", 0.0))
+            gamma_max = float(getattr(layer, "gamma_max", 1.0))
+            gamma = gamma_min + (gamma_max - gamma_min) * torch.sigmoid(layer.decay_logit)
             gammas.append((gamma.min().item(), gamma.mean().item(), gamma.max().item()))
 
     parts = []

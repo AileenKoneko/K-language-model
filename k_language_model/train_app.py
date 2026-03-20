@@ -20,7 +20,14 @@ from .runtime import (
     maybe_write_run_manifest,
     setup_logging,
 )
-from .trainer import TrainConfig, _collect_eval_refine_stats, ce_to_bpc, eval_deterministic, train_model
+from .trainer import (
+    TrainConfig,
+    _collect_eval_refine_stats,
+    _collect_k_layer_stats,
+    ce_to_bpc,
+    eval_deterministic,
+    train_model,
+)
 
 
 def _parse_adaptive_cutoffs(raw: str | None) -> list[int] | None:
@@ -94,6 +101,32 @@ def build_parser(description: str | None = None) -> argparse.ArgumentParser:
         help="Optional token embedding dimension. Defaults to --d-model when omitted.",
     )
     p.add_argument("--rank", type=int, default=32)
+    p.add_argument(
+        "--k-base-rank",
+        type=int,
+        default=2,
+        help="Low-rank factorization rank for causal k_base path. Set <=0 to use dense k_base.",
+    )
+    p.add_argument(
+        "--k-base-impl",
+        type=str,
+        choices=["auto", "fused", "scan"],
+        default="auto",
+        help="Low-rank k_base kernel: auto picks fused on accelerators when temporary tensors fit; scan minimizes memory.",
+    )
+    p.add_argument(
+        "--share-k-base",
+        dest="share_k_base",
+        action="store_true",
+        help="Use one shared dense learnable k_base matrix across all K2 layers (requires --k-base-rank <= 0).",
+    )
+    p.add_argument(
+        "--no-share-k-base",
+        dest="share_k_base",
+        action="store_false",
+        help="Use per-layer dense k_base matrices when --k-base-rank <= 0.",
+    )
+    p.set_defaults(share_k_base=False)
     p.add_argument("--n-k2", type=int, default=4)
     p.add_argument("--head-mode", type=str, choices=["linear", "gelu", "adaptive"], default="linear")
     p.add_argument("--head-mult", type=int, default=6)
@@ -123,10 +156,12 @@ def build_parser(description: str | None = None) -> argparse.ArgumentParser:
     p.add_argument(
         "--decay-impl",
         type=str,
-        choices=["mask", "block"],
+        choices=["mask", "block", "kernel"],
         default="mask",
-        help="Gamma-decay backend: 'mask' is fastest, 'block' uses less memory.",
+        help="Gamma-decay backend: mask (baseline), block (lower memory), kernel (experimental Triton CUDA path).",
     )
+    p.add_argument("--gamma-min", type=float, default=0.85, help="Lower bound for per-rank gamma decay values.")
+    p.add_argument("--gamma-max", type=float, default=1.0, help="Upper bound for per-rank gamma decay values.")
     p.add_argument("--alpha-cap", type=float, default=0.8)
     p.add_argument("--lr", type=float, default=4e-3)
     p.add_argument("--lr-floor", type=float, default=1e-4)
@@ -155,6 +190,7 @@ def build_parser(description: str | None = None) -> argparse.ArgumentParser:
     p.add_argument("--eval-interval", type=int, default=250)
     p.add_argument(
         "--diagnostics",
+        "--diagnostic",
         action="store_true",
         help="Enable verbose diagnostic logging (grad stats, layer stats, update/weight ratios) at eval intervals.",
     )
@@ -344,6 +380,9 @@ def main() -> None:
         emb_dim=args.emb_dim,
         rank=cfg.rank,
         n_k2=cfg.n_k2,
+        k_base_rank=args.k_base_rank,
+        k_base_impl=args.k_base_impl,
+        share_k_base=args.share_k_base,
         emb_dropout=cfg.emb_dropout,
         mlp_dropout=cfg.mlp_dropout,
         residual_dropout=cfg.residual_dropout,
@@ -355,6 +394,8 @@ def main() -> None:
         refine_steps=args.refine_steps,
         train_refine_steps=args.train_refine_steps,
         alpha_cap=cfg.alpha_cap,
+        gamma_min=args.gamma_min,
+        gamma_max=args.gamma_max,
         decay_impl=args.decay_impl,
     )
 
@@ -378,7 +419,7 @@ def main() -> None:
             f"{params['other']:,}",
         )
         LOG.info(
-            "Model config | tokenizer=%s | emb_dim=%d | d_model=%d | tied_weights=%s | head_mode=%s | head_mult=%d | head_dropout=%.2f | alpha_cap=%.2f | refine_steps[train/eval]=%d/%d",
+            "Model config | tokenizer=%s | emb_dim=%d | d_model=%d | tied_weights=%s | head_mode=%s | head_mult=%d | head_dropout=%.2f | k_base_rank=%d | k_base_impl=%s | share_k_base=%s | alpha_cap=%.2f | gamma[min/max]=%.3f/%.3f | refine_steps[train/eval]=%d/%d",
             tokenizer.describe(),
             model_for_stats.emb_dim,
             model_for_stats.d_model,
@@ -386,7 +427,12 @@ def main() -> None:
             args.head_mode,
             args.head_mult,
             args.head_dropout,
+            model_for_stats.k_base_rank,
+            model_for_stats.k_base_impl,
+            str(getattr(model_for_stats, "share_k_base", False)).lower(),
             cfg.alpha_cap,
+            args.gamma_min,
+            args.gamma_max,
             model_for_stats.train_refine_steps,
             model_for_stats.refine_steps,
         )
@@ -433,6 +479,10 @@ def main() -> None:
         eval_refine_stats = _collect_eval_refine_stats(model)
         if eval_refine_stats:
             LOG.info("eval_refinement | %s", eval_refine_stats)
+        if args.diagnostics:
+            k_stats = _collect_k_layer_stats(model)
+            if k_stats:
+                LOG.info("layer_stats | %s", k_stats)
 
         if args.sample:
             top_k = args.top_k if args.top_k > 0 else None

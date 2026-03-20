@@ -2,23 +2,21 @@
 set -euo pipefail
 
 # Usage:
-#   bash configs/colab_seed_sweep.sh [LOG_PATH]
+#   bash configs/colab_seed_sweep_wikitext2_kbase.sh [LOG_PATH]
 #
 # Example:
-#   bash configs/colab_seed_sweep.sh \
-#     /content/drive/MyDrive/k_language_model/logs/k_lm_seed_sweep.log
+#   bash configs/colab_seed_sweep_wikitext2_kbase.sh \
+#     /content/drive/MyDrive/k_operators/logs/k_lm_seed_sweep_wikitext2_kbase.log
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 SCRIPT_PATH="${SCRIPT_PATH:-}"
-DEFAULT_LOG="/content/drive/MyDrive/k_operators/logs/k_lm_seed_sweep_$(date +%Y%m%d_%H%M%S).log"
+SP_MODEL="${SP_MODEL:-./data/tokenizers/wikitext2_unigram_8192.model}"
+CKPT_BASENAME="${CKPT_BASENAME:-papiezu_prosze_test_12}"
+DEFAULT_LOG="/content/drive/MyDrive/k_operators/logs/k_lm_seed_sweep_wikitext2_kbase_$(date +%Y%m%d_%H%M%S).log"
 LOG_PATH="${1:-$DEFAULT_LOG}"
 RUN_TAG="$(date +%Y%m%d_%H%M%S)_$$"
 CACHE_ROOT="${CACHE_ROOT:-/tmp/k_lm_compile_cache_${RUN_TAG}}"
 CKPT_ROOT="${CKPT_ROOT:-/content/drive/MyDrive/k_operators/checkpoints/${RUN_TAG}}"
-DATASET="${DATASET:-shakespeare}"
-TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-}"
-VAL_DATA_PATH="${VAL_DATA_PATH:-}"
-VAL_FRAC="${VAL_FRAC:-0.1}"
 
 if [[ "$LOG_PATH" == /content/drive/* ]] && [[ ! -d /content/drive/MyDrive ]]; then
   echo "Google Drive is not mounted at /content/drive/MyDrive." >&2
@@ -29,6 +27,11 @@ fi
 
 mkdir -p "$(dirname "$LOG_PATH")"
 mkdir -p "$CKPT_ROOT"
+
+if [[ ! -f "$SP_MODEL" ]]; then
+  echo "SentencePiece model not found: $SP_MODEL" >&2
+  exit 1
+fi
 
 if [[ -n "$SCRIPT_PATH" ]]; then
   if [[ ! -f "$SCRIPT_PATH" ]]; then
@@ -45,57 +48,57 @@ else
 fi
 
 BASE_ARGS=(
-  --dataset "$DATASET"
-  --val-frac "$VAL_FRAC"
-  --d-model 128
-  --head-mode gelu
-  --head-mult 1
+  --dataset wikitext2
+  --tokenizer sentencepiece
+  --sp-model "$SP_MODEL"
+  --sp-vocab-size 8192
+  --d-model 256
+  --head-mode adaptive
+  --adaptive-cutoffs 1024,4096
+  --emb-dim 64
+  --head-dropout 0.3
   --n-k2 6
+  --rank 32
   --k-base-rank 0
   --share-k-base
-  --k-base-impl fused
+  --window 512
   --refine-steps 0
-  --rank 32
-  --window 256
-  --optimizer-mode simple
+  --optimizer-mode grouped
   --fused-adamw
-  --batch-size 64
-  --steps 3500
+  --batch-size 32
+  --steps 25000
   --eval-interval 250
   --compile
   --compile-mode default
   --lr 10e-3
-  --warmup-steps 2000
+  --warmup-steps 3000
   --alpha-cap 0.95
   --decay-impl mask
-  --lr-floor 3.5e-04
-  --head-dropout 0.15
+  --lr-floor 1e-04
   --gamma-min 0.15
+  --gamma-max 0.995
+  --residual-dropout 0.1
+  --emb-dropout 0.16
+  --mlp-dropout 0.2
+  --diagnostics
 )
 
-if [[ -n "$TRAIN_DATA_PATH" ]]; then
-  BASE_ARGS+=(--data-path "$TRAIN_DATA_PATH")
-fi
-if [[ -n "$VAL_DATA_PATH" ]]; then
-  BASE_ARGS+=(--val-path "$VAL_DATA_PATH")
-fi
-
-SEEDS=(42 42 42 69 420 666 2137)
+# Intentionally unique seeds (no repeated 42 runs).
+SEEDS=(42 69 420 666 2137)
 TOTAL_RUNS="${#SEEDS[@]}"
 
 {
-  echo "== K-LM Colab Seed Sweep =="
+  echo "== K-LM Colab Seed Sweep (wikitext2 k-base config) =="
   echo "start_utc=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   echo "python_bin=$PYTHON_BIN"
   echo "script=$SCRIPT_PATH"
+  echo "sp_model=$SP_MODEL"
   echo "cache_root=$CACHE_ROOT"
   echo "ckpt_root=$CKPT_ROOT"
-  echo "dataset=$DATASET"
-  echo "train_data_path=${TRAIN_DATA_PATH:-<default>}"
-  echo "val_data_path=${VAL_DATA_PATH:-<default>}"
-  echo "val_frac=$VAL_FRAC"
+  echo "ckpt_basename=$CKPT_BASENAME"
   echo "base_args=${BASE_ARGS[*]}"
   echo "seeds=${SEEDS[*]}"
+  echo "diagnostics=enabled"
   echo
 } | tee "$LOG_PATH"
 
@@ -106,7 +109,7 @@ for idx in "${!SEEDS[@]}"; do
   run_inductor_cache="${run_cache_dir}/inductor"
   run_triton_cache="${run_cache_dir}/triton"
   run_cuda_cache="${run_cache_dir}/cuda"
-  run_ckpt="${CKPT_ROOT}/run_${run_no}_seed_${seed}.pt"
+  run_ckpt="${CKPT_ROOT}/${CKPT_BASENAME}_run_${run_no}_seed_${seed}.pt"
   mkdir -p "$run_inductor_cache" "$run_triton_cache" "$run_cuda_cache"
 
   {

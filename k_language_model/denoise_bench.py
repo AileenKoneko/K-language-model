@@ -378,7 +378,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--d-model", type=int, default=32)
     p.add_argument("--rank", type=int, default=8)
     p.add_argument("--conv-kernel", type=int, default=7)
-    p.add_argument("--decay-impl", choices=["mask", "block"], default="mask")
+    p.add_argument("--decay-impl", choices=["mask", "block", "kernel"], default="mask")
     p.add_argument("--lr", type=float, default=3e-3)
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--clip-grad-norm", type=float, default=1.0)

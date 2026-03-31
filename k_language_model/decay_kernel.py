@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import torch
 
+_TRITON_INIT_ERROR: str | None = None
+
 try:
     import triton
     import triton.language as tl
 
     _TRITON_AVAILABLE = True
-except Exception:
+except Exception as exc:
     triton = None
     tl = None
     _TRITON_AVAILABLE = False
+    _TRITON_INIT_ERROR = f"{type(exc).__name__}: {exc}"
 
 _MAX_KERNEL_RANK = 64
 
@@ -31,167 +34,171 @@ def _next_power_of_two(x: int) -> int:
 
 
 if _TRITON_AVAILABLE:
-    _KERNEL_CONFIGS = [
-        triton.Config({"BLOCK_D": 16}, num_warps=1, num_stages=2),
-        triton.Config({"BLOCK_D": 32}, num_warps=2, num_stages=2),
-        triton.Config({"BLOCK_D": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=2),
-    ]
+    try:
+        _KERNEL_CONFIGS = [
+            triton.Config({"BLOCK_D": 16}, num_warps=1, num_stages=2),
+            triton.Config({"BLOCK_D": 32}, num_warps=2, num_stages=2),
+            triton.Config({"BLOCK_D": 64}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=2),
+        ]
 
-    @triton.autotune(configs=_KERNEL_CONFIGS, key=["R", "D"])
-    @triton.jit
-    def _decay_forward_kernel(
-        q_ptr,
-        k_ptr,
-        h_ptr,
-        gamma_ptr,
-        out_ptr,
-        final_state_ptr,
-        B,
-        W,
-        R,
-        D,
-        q_stride_b,
-        q_stride_w,
-        q_stride_r,
-        k_stride_b,
-        k_stride_w,
-        k_stride_r,
-        h_stride_b,
-        h_stride_w,
-        h_stride_d,
-        out_stride_b,
-        out_stride_w,
-        out_stride_d,
-        state_stride_b,
-        state_stride_r,
-        state_stride_d,
-        BLOCK_R: tl.constexpr,
-        BLOCK_D: tl.constexpr,
-    ):
-        pid_b = tl.program_id(0)
-        pid_d_blk = tl.program_id(1)
+        @triton.autotune(configs=_KERNEL_CONFIGS, key=["R", "D"])
+        @triton.jit
+        def _decay_forward_kernel(
+            q_ptr,
+            k_ptr,
+            h_ptr,
+            gamma_ptr,
+            out_ptr,
+            final_state_ptr,
+            B,
+            W,
+            R,
+            D,
+            q_stride_b,
+            q_stride_w,
+            q_stride_r,
+            k_stride_b,
+            k_stride_w,
+            k_stride_r,
+            h_stride_b,
+            h_stride_w,
+            h_stride_d,
+            out_stride_b,
+            out_stride_w,
+            out_stride_d,
+            state_stride_b,
+            state_stride_r,
+            state_stride_d,
+            BLOCK_R: tl.constexpr,
+            BLOCK_D: tl.constexpr,
+        ):
+            pid_b = tl.program_id(0)
+            pid_d_blk = tl.program_id(1)
 
-        offs_d = pid_d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
-        mask_d = offs_d < D
-        offs_r = tl.arange(0, BLOCK_R)
-        mask_r = offs_r < R
+            offs_d = pid_d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
+            mask_d = offs_d < D
+            offs_r = tl.arange(0, BLOCK_R)
+            mask_r = offs_r < R
 
-        gamma = tl.load(gamma_ptr + offs_r, mask=mask_r, other=0.0).to(tl.float32)
-        state = tl.zeros((BLOCK_R, BLOCK_D), dtype=tl.float32)
+            gamma = tl.load(gamma_ptr + offs_r, mask=mask_r, other=0.0).to(tl.float32)
+            state = tl.zeros((BLOCK_R, BLOCK_D), dtype=tl.float32)
 
-        q_b_ptr = q_ptr + pid_b * q_stride_b
-        k_b_ptr = k_ptr + pid_b * k_stride_b
-        h_b_ptr = h_ptr + pid_b * h_stride_b
-        out_b_ptr = out_ptr + pid_b * out_stride_b
-        state_b_ptr = final_state_ptr + pid_b * state_stride_b
+            q_b_ptr = q_ptr + pid_b * q_stride_b
+            k_b_ptr = k_ptr + pid_b * k_stride_b
+            h_b_ptr = h_ptr + pid_b * h_stride_b
+            out_b_ptr = out_ptr + pid_b * out_stride_b
+            state_b_ptr = final_state_ptr + pid_b * state_stride_b
 
-        for t in range(0, W):
-            h_t = tl.load(h_b_ptr + t * h_stride_w + offs_d * h_stride_d, mask=mask_d, other=0.0).to(tl.float32)
-            k_t = tl.load(k_b_ptr + t * k_stride_w + offs_r * k_stride_r, mask=mask_r, other=0.0).to(tl.float32)
-            q_t = tl.load(q_b_ptr + t * q_stride_w + offs_r * q_stride_r, mask=mask_r, other=0.0).to(tl.float32)
+            for t in range(0, W):
+                h_t = tl.load(h_b_ptr + t * h_stride_w + offs_d * h_stride_d, mask=mask_d, other=0.0).to(tl.float32)
+                k_t = tl.load(k_b_ptr + t * k_stride_w + offs_r * k_stride_r, mask=mask_r, other=0.0).to(tl.float32)
+                q_t = tl.load(q_b_ptr + t * q_stride_w + offs_r * q_stride_r, mask=mask_r, other=0.0).to(tl.float32)
 
-            state = gamma[:, None] * state + k_t[:, None] * h_t[None, :]
-            out_t = tl.sum(q_t[:, None] * state, axis=0)
-            tl.store(out_b_ptr + t * out_stride_w + offs_d * out_stride_d, out_t, mask=mask_d)
+                state = gamma[:, None] * state + k_t[:, None] * h_t[None, :]
+                out_t = tl.sum(q_t[:, None] * state, axis=0)
+                tl.store(out_b_ptr + t * out_stride_w + offs_d * out_stride_d, out_t, mask=mask_d)
 
-        state_ptrs = state_b_ptr + offs_r[:, None] * state_stride_r + offs_d[None, :] * state_stride_d
-        tl.store(state_ptrs, state, mask=mask_r[:, None] & mask_d[None, :])
+            state_ptrs = state_b_ptr + offs_r[:, None] * state_stride_r + offs_d[None, :] * state_stride_d
+            tl.store(state_ptrs, state, mask=mask_r[:, None] & mask_d[None, :])
 
-    @triton.autotune(configs=_KERNEL_CONFIGS, key=["R", "D"])
-    @triton.jit
-    def _decay_backward_kernel(
-        q_ptr,
-        k_ptr,
-        h_ptr,
-        gamma_ptr,
-        final_state_ptr,
-        grad_out_ptr,
-        grad_q_ptr,
-        grad_k_ptr,
-        grad_h_ptr,
-        grad_gamma_ptr,
-        B,
-        W,
-        R,
-        D,
-        q_stride_b,
-        q_stride_w,
-        q_stride_r,
-        k_stride_b,
-        k_stride_w,
-        k_stride_r,
-        h_stride_b,
-        h_stride_w,
-        h_stride_d,
-        state_stride_b,
-        state_stride_r,
-        state_stride_d,
-        go_stride_b,
-        go_stride_w,
-        go_stride_d,
-        gq_stride_b,
-        gq_stride_w,
-        gq_stride_r,
-        gk_stride_b,
-        gk_stride_w,
-        gk_stride_r,
-        gh_stride_b,
-        gh_stride_w,
-        gh_stride_d,
-        BLOCK_R: tl.constexpr,
-        BLOCK_D: tl.constexpr,
-    ):
-        pid_b = tl.program_id(0)
-        pid_d_blk = tl.program_id(1)
+        @triton.autotune(configs=_KERNEL_CONFIGS, key=["R", "D"])
+        @triton.jit
+        def _decay_backward_kernel(
+            q_ptr,
+            k_ptr,
+            h_ptr,
+            gamma_ptr,
+            final_state_ptr,
+            grad_out_ptr,
+            grad_q_ptr,
+            grad_k_ptr,
+            grad_h_ptr,
+            grad_gamma_ptr,
+            B,
+            W,
+            R,
+            D,
+            q_stride_b,
+            q_stride_w,
+            q_stride_r,
+            k_stride_b,
+            k_stride_w,
+            k_stride_r,
+            h_stride_b,
+            h_stride_w,
+            h_stride_d,
+            state_stride_b,
+            state_stride_r,
+            state_stride_d,
+            go_stride_b,
+            go_stride_w,
+            go_stride_d,
+            gq_stride_b,
+            gq_stride_w,
+            gq_stride_r,
+            gk_stride_b,
+            gk_stride_w,
+            gk_stride_r,
+            gh_stride_b,
+            gh_stride_w,
+            gh_stride_d,
+            BLOCK_R: tl.constexpr,
+            BLOCK_D: tl.constexpr,
+        ):
+            pid_b = tl.program_id(0)
+            pid_d_blk = tl.program_id(1)
 
-        offs_d = pid_d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
-        mask_d = offs_d < D
-        offs_r = tl.arange(0, BLOCK_R)
-        mask_r = offs_r < R
+            offs_d = pid_d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
+            mask_d = offs_d < D
+            offs_r = tl.arange(0, BLOCK_R)
+            mask_r = offs_r < R
 
-        gamma = tl.load(gamma_ptr + offs_r, mask=mask_r, other=0.0).to(tl.float32)
-        inv_gamma = tl.where(mask_r, 1.0 / tl.maximum(gamma, 1e-8), 0.0)
+            gamma = tl.load(gamma_ptr + offs_r, mask=mask_r, other=0.0).to(tl.float32)
+            inv_gamma = tl.where(mask_r, 1.0 / tl.maximum(gamma, 1e-8), 0.0)
 
-        q_b_ptr = q_ptr + pid_b * q_stride_b
-        k_b_ptr = k_ptr + pid_b * k_stride_b
-        h_b_ptr = h_ptr + pid_b * h_stride_b
-        go_b_ptr = grad_out_ptr + pid_b * go_stride_b
-        gq_b_ptr = grad_q_ptr + pid_b * gq_stride_b
-        gk_b_ptr = grad_k_ptr + pid_b * gk_stride_b
-        gh_b_ptr = grad_h_ptr + pid_b * gh_stride_b
-        state_b_ptr = final_state_ptr + pid_b * state_stride_b
+            q_b_ptr = q_ptr + pid_b * q_stride_b
+            k_b_ptr = k_ptr + pid_b * k_stride_b
+            h_b_ptr = h_ptr + pid_b * h_stride_b
+            go_b_ptr = grad_out_ptr + pid_b * go_stride_b
+            gq_b_ptr = grad_q_ptr + pid_b * gq_stride_b
+            gk_b_ptr = grad_k_ptr + pid_b * gk_stride_b
+            gh_b_ptr = grad_h_ptr + pid_b * gh_stride_b
+            state_b_ptr = final_state_ptr + pid_b * state_stride_b
 
-        state_ptrs = state_b_ptr + offs_r[:, None] * state_stride_r + offs_d[None, :] * state_stride_d
-        state_t = tl.load(state_ptrs, mask=mask_r[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
-        grad_state_next = tl.zeros((BLOCK_R, BLOCK_D), dtype=tl.float32)
-        grad_gamma_acc = tl.zeros((BLOCK_R,), dtype=tl.float32)
+            state_ptrs = state_b_ptr + offs_r[:, None] * state_stride_r + offs_d[None, :] * state_stride_d
+            state_t = tl.load(state_ptrs, mask=mask_r[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+            grad_state_next = tl.zeros((BLOCK_R, BLOCK_D), dtype=tl.float32)
+            grad_gamma_acc = tl.zeros((BLOCK_R,), dtype=tl.float32)
 
-        for rev in range(0, W):
-            t = W - 1 - rev
+            for rev in range(0, W):
+                t = W - 1 - rev
 
-            h_t = tl.load(h_b_ptr + t * h_stride_w + offs_d * h_stride_d, mask=mask_d, other=0.0).to(tl.float32)
-            go_t = tl.load(go_b_ptr + t * go_stride_w + offs_d * go_stride_d, mask=mask_d, other=0.0).to(tl.float32)
-            k_t = tl.load(k_b_ptr + t * k_stride_w + offs_r * k_stride_r, mask=mask_r, other=0.0).to(tl.float32)
-            q_t = tl.load(q_b_ptr + t * q_stride_w + offs_r * q_stride_r, mask=mask_r, other=0.0).to(tl.float32)
+                h_t = tl.load(h_b_ptr + t * h_stride_w + offs_d * h_stride_d, mask=mask_d, other=0.0).to(tl.float32)
+                go_t = tl.load(go_b_ptr + t * go_stride_w + offs_d * go_stride_d, mask=mask_d, other=0.0).to(tl.float32)
+                k_t = tl.load(k_b_ptr + t * k_stride_w + offs_r * k_stride_r, mask=mask_r, other=0.0).to(tl.float32)
+                q_t = tl.load(q_b_ptr + t * q_stride_w + offs_r * q_stride_r, mask=mask_r, other=0.0).to(tl.float32)
 
-            s_prev = (state_t - k_t[:, None] * h_t[None, :]) * inv_gamma[:, None]
-            grad_state = grad_state_next + q_t[:, None] * go_t[None, :]
+                s_prev = (state_t - k_t[:, None] * h_t[None, :]) * inv_gamma[:, None]
+                grad_state = grad_state_next + q_t[:, None] * go_t[None, :]
 
-            grad_h_t = tl.sum(grad_state * k_t[:, None], axis=0)
-            tl.store(gh_b_ptr + t * gh_stride_w + offs_d * gh_stride_d, grad_h_t, mask=mask_d)
+                grad_h_t = tl.sum(grad_state * k_t[:, None], axis=0)
+                tl.store(gh_b_ptr + t * gh_stride_w + offs_d * gh_stride_d, grad_h_t, mask=mask_d)
 
-            grad_q_t = tl.sum(go_t[None, :] * state_t, axis=1)
-            grad_k_t = tl.sum(grad_state * h_t[None, :], axis=1)
-            grad_gamma_acc += tl.sum(grad_state * s_prev, axis=1)
+                grad_q_t = tl.sum(go_t[None, :] * state_t, axis=1)
+                grad_k_t = tl.sum(grad_state * h_t[None, :], axis=1)
+                grad_gamma_acc += tl.sum(grad_state * s_prev, axis=1)
 
-            tl.atomic_add(gq_b_ptr + t * gq_stride_w + offs_r * gq_stride_r, grad_q_t, mask=mask_r)
-            tl.atomic_add(gk_b_ptr + t * gk_stride_w + offs_r * gk_stride_r, grad_k_t, mask=mask_r)
+                tl.atomic_add(gq_b_ptr + t * gq_stride_w + offs_r * gq_stride_r, grad_q_t, mask=mask_r)
+                tl.atomic_add(gk_b_ptr + t * gk_stride_w + offs_r * gk_stride_r, grad_k_t, mask=mask_r)
 
-            grad_state_next = grad_state * gamma[:, None]
-            state_t = s_prev
+                grad_state_next = grad_state * gamma[:, None]
+                state_t = s_prev
 
-        tl.atomic_add(grad_gamma_ptr + offs_r, grad_gamma_acc, mask=mask_r)
+            tl.atomic_add(grad_gamma_ptr + offs_r, grad_gamma_acc, mask=mask_r)
+    except Exception as exc:
+        _TRITON_AVAILABLE = False
+        _TRITON_INIT_ERROR = f"{type(exc).__name__}: {exc}"
 
 
 def _decay_forward_cuda(
@@ -404,5 +411,7 @@ class _DecayKernelFn(torch.autograd.Function):
 
 def decay_kernel(q: torch.Tensor, k: torch.Tensor, h: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
     if not is_decay_kernel_available(q.device, q.size(-1)):
+        if _TRITON_INIT_ERROR:
+            raise RuntimeError(f"Decay Triton kernel is unavailable ({_TRITON_INIT_ERROR}).")
         raise RuntimeError("Decay Triton kernel is unavailable for this device/rank.")
     return _DecayKernelFn.apply(q.contiguous(), k.contiguous(), h.contiguous(), gamma.contiguous())

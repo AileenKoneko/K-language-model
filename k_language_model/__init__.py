@@ -1,6 +1,6 @@
 """K-Operators language model package."""
 
-from .train_app import main as train_main
-from .infer_app import main as infer_main
+from .kstack import KStackModel
+from .rosa import ROSA, rosa_next_token_ids, rosa_next_token_ids_batch
 
-__all__ = ["train_main", "infer_main"]
+__all__ = ["KStackModel", "ROSA", "rosa_next_token_ids", "rosa_next_token_ids_batch"]

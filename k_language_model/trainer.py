@@ -11,7 +11,7 @@ import torch.nn as nn
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import get_batch
 from .model import KStackModel
-from .runtime import DEVICE, LOG, USE_AMP, _autocast_context, _unwrap_model
+from .runtime import AMP_DTYPE, DEVICE, LOG, USE_AMP, _autocast_context, _unwrap_model
 
 
 def ce_to_bpc(ce: float) -> float:
@@ -22,8 +22,6 @@ def ce_to_bpc(ce: float) -> float:
 def eval_deterministic(model: nn.Module, data: torch.Tensor, window: int, batch_size: int) -> tuple[float, float]:
     model.eval()
     core_model = _unwrap_model(model)
-    if hasattr(core_model, "reset_eval_refine_diagnostics"):
-        core_model.reset_eval_refine_diagnostics()
 
     device_obj = torch.device(DEVICE)
     if data.device != device_obj:
@@ -123,6 +121,18 @@ def _collect_grad_stats(model: nn.Module, topk: int = 3) -> Dict[str, object]:
 
 
 def _build_optimizer_param_groups(model: nn.Module, cfg: TrainConfig) -> List[Dict[str, object]]:
+    def normalize_name(name: str) -> str:
+        # torch.compile / wrappers can prefix names (e.g. "_orig_mod.").
+        while True:
+            if name.startswith("_orig_mod."):
+                name = name[len("_orig_mod."):]
+                continue
+            if name.startswith("module."):
+                name = name[len("module."):]
+                continue
+            break
+        return name
+
     groups = {
         "core": {"params": [], "weight_decay": cfg.weight_decay, "lr": cfg.lr},
         "bias": {"params": [], "weight_decay": 0.0, "lr": cfg.lr * cfg.bias_lr_mult},
@@ -138,14 +148,20 @@ def _build_optimizer_param_groups(model: nn.Module, cfg: TrainConfig) -> List[Di
         if p.data_ptr() in seen:
             continue
         seen.add(p.data_ptr())
+        norm_name = normalize_name(name)
 
-        if any(t in name for t in ("decay_logit", "alpha_logit", "k_base_gate_logit", "eta_logit")):
+        if any(t in norm_name for t in ("decay_logit", "alpha_logit", "rho_logit", "k_base_gate_logit")):
             groups["k_logit"]["params"].append(p)
-        elif name.startswith("emb.") or name.startswith("emb_to_model"):
+        elif (
+            norm_name.startswith("emb.")
+            or norm_name.startswith("emb_to_model")
+            or norm_name.startswith("rosa_emb.")
+            or norm_name.startswith("rosa_to_model")
+        ):
             groups["emb"]["params"].append(p)
-        elif name.endswith(".bias"):
+        elif norm_name.endswith(".bias"):
             groups["bias"]["params"].append(p)
-        elif ("norm" in name) or name.endswith("scale"):
+        elif ("norm" in norm_name) or norm_name.endswith("scale"):
             groups["norm"]["params"].append(p)
         else:
             groups["core"]["params"].append(p)
@@ -190,45 +206,38 @@ def _collect_k_layer_stats(model: nn.Module) -> str:
     gates = []
     alphas = []
     gammas = []
+    rhos = []
     for layer in model.k_stack.layers:
         if hasattr(layer, "k_base_gate_logit"):
             gates.append(torch.sigmoid(layer.k_base_gate_logit).item())
         if hasattr(layer, "alpha_logit"):
             alpha_cap = float(getattr(layer, "alpha_cap", 1.0))
-            alphas.append((alpha_cap * torch.sigmoid(layer.alpha_logit)).item())
+            alpha_vec = alpha_cap * torch.sigmoid(layer.alpha_logit)
+            alphas.append((alpha_vec.min().item(), alpha_vec.mean().item(), alpha_vec.max().item()))
         if hasattr(layer, "decay_logit"):
             gamma_min = float(getattr(layer, "gamma_min", 0.0))
             gamma_max = float(getattr(layer, "gamma_max", 1.0))
             gamma = gamma_min + (gamma_max - gamma_min) * torch.sigmoid(layer.decay_logit)
             gammas.append((gamma.min().item(), gamma.mean().item(), gamma.max().item()))
+        if hasattr(layer, "rho_logit"):
+            rhos.append(torch.sigmoid(layer.rho_logit).item())
 
     parts = []
     if gates:
         parts.append(f"gate[min/mean/max]={min(gates):.3f}/{sum(gates) / len(gates):.3f}/{max(gates):.3f}")
     if alphas:
-        parts.append(f"alpha[min/mean/max]={min(alphas):.3f}/{sum(alphas) / len(alphas):.3f}/{max(alphas):.3f}")
+        a_min = min(x[0] for x in alphas)
+        a_mean = sum(x[1] for x in alphas) / len(alphas)
+        a_max = max(x[2] for x in alphas)
+        parts.append(f"alpha[min/mean/max]={a_min:.3f}/{a_mean:.3f}/{a_max:.3f}")
     if gammas:
         g_min = min(x[0] for x in gammas)
         g_mean = sum(x[1] for x in gammas) / len(gammas)
         g_max = max(x[2] for x in gammas)
         parts.append(f"gamma[min/mean/max]={g_min:.3f}/{g_mean:.3f}/{g_max:.3f}")
+    if rhos:
+        parts.append(f"rho[min/mean/max]={min(rhos):.3f}/{sum(rhos) / len(rhos):.3f}/{max(rhos):.3f}")
     return " | ".join(parts)
-
-
-def _collect_eval_refine_stats(model: nn.Module) -> str:
-    model = _unwrap_model(model)
-    if not hasattr(model, "get_eval_refine_diagnostics"):
-        return ""
-
-    diag = model.get_eval_refine_diagnostics()
-    eta = float(diag.get("eta", float("nan")))
-    eta_logit = float(getattr(model, "eta_logit", torch.tensor(float("nan"))).detach().cpu().item())
-    delta_mean = diag.get("delta_mean", [])
-    batches = int(diag.get("batches", 0))
-    if not delta_mean:
-        return f"eta={eta:.6f} | eta_logit={eta_logit:.6f} | loop_delta_mean=none | batches={batches}"
-    delta_str = ", ".join(f"L{i + 1}={v:.2e}" for i, v in enumerate(delta_mean))
-    return f"eta={eta:.6f} | eta_logit={eta_logit:.6f} | loop_delta_mean={delta_str} | batches={batches}"
 
 
 @torch.no_grad()
@@ -242,7 +251,19 @@ def _collect_update_weight_stats(
     ratios = []
     by_layer = {}
 
+    def normalize_name(name: str) -> str:
+        while True:
+            if name.startswith("_orig_mod."):
+                name = name[len("_orig_mod."):]
+                continue
+            if name.startswith("module."):
+                name = name[len("module."):]
+                continue
+            break
+        return name
+
     def layer_key(name: str) -> str:
+        name = normalize_name(name)
         if name.startswith("emb."):
             return "emb"
         if name.startswith("emb_to_model"):
@@ -353,10 +374,11 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
         lr_lambda=lr_lambda,
         last_epoch=start_step - 1,
     )
-    scaler = torch.amp.GradScaler("cuda") if USE_AMP else None
+    use_grad_scaler = bool(USE_AMP and AMP_DTYPE == torch.float16)
+    scaler = torch.amp.GradScaler("cuda") if use_grad_scaler else None
 
     LOG.info(
-        "Training start | device=%s | steps=%d | window=%d | batch=%d | lr=%.2e | betas=(%.3f, %.3f) | warmup=%d | opt_mode=%s | fused_adamw=%s",
+        "Training start | device=%s | steps=%d | window=%d | batch=%d | lr=%.2e | betas=(%.3f, %.3f) | warmup=%d | opt_mode=%s | fused_adamw=%s | grad_scaler=%s",
         DEVICE,
         cfg.steps,
         cfg.window,
@@ -367,6 +389,7 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
         cfg.warmup_steps,
         cfg.optimizer_mode,
         str(fused_used).lower(),
+        str(use_grad_scaler).lower(),
     )
     group_parts = []
     for g in optimizer.param_groups:
@@ -397,22 +420,35 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                 loss = model(x, targets=y)
 
             optimizer.zero_grad(set_to_none=True)
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                raw_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.clip_grad_norm).item())
-                scaler.step(optimizer)
-                scaler.update()
+            step_applied = False
+            if not bool(torch.isfinite(loss).all().item()):
+                LOG.warning("Non-finite loss at step=%d (loss=%s); skipping optimizer step.", step, float(loss.detach().item()))
             else:
-                loss.backward()
-                raw_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.clip_grad_norm).item())
-                optimizer.step()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    raw_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.clip_grad_norm).item())
+                    if math.isfinite(raw_grad_norm):
+                        scaler.step(optimizer)
+                        step_applied = True
+                    else:
+                        LOG.warning("Non-finite gradient norm at step=%d (gnorm=%s); skipping optimizer step.", step, raw_grad_norm)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    raw_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.clip_grad_norm).item())
+                    if math.isfinite(raw_grad_norm):
+                        optimizer.step()
+                        step_applied = True
+                    else:
+                        LOG.warning("Non-finite gradient norm at step=%d (gnorm=%s); skipping optimizer step.", step, raw_grad_norm)
 
-            scheduler.step()
-            train_loss = float(loss.item())
-            train_loss_ema = train_loss if train_loss_ema is None else 0.95 * train_loss_ema + 0.05 * train_loss
-            if cfg.diagnostics and not math.isnan(raw_grad_norm):
-                grad_norm_hist.append(raw_grad_norm)
+            if step_applied:
+                scheduler.step()
+                train_loss = float(loss.item())
+                train_loss_ema = train_loss if train_loss_ema is None else 0.95 * train_loss_ema + 0.05 * train_loss
+                if cfg.diagnostics and not math.isnan(raw_grad_norm):
+                    grad_norm_hist.append(raw_grad_norm)
 
         step_elapsed = time.time() - t0
         if step > 0:
@@ -481,7 +517,6 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                 grad_stats = _collect_grad_stats(model, topk=cfg.grad_topk)
                 top_grad = ", ".join(f"{n}={v:.2e}" for n, v in grad_stats["top_grad_params"]) or "none"
                 k_stats = _collect_k_layer_stats(model)
-                eval_refine_stats = _collect_eval_refine_stats(model)
                 clip_hit = (not math.isnan(raw_grad_norm)) and (raw_grad_norm > cfg.clip_grad_norm)
                 grad_window = sum(grad_norm_hist) / len(grad_norm_hist) if grad_norm_hist else float("nan")
                 val_window_drop = (val_ce_hist[0] - val_ce_hist[-1]) if len(val_ce_hist) >= 2 else float("nan")
@@ -520,8 +555,6 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                 LOG.info("adam_expavg_weight_by_layer[min/mean/max] | %s", uw_by_layer)
                 if k_stats:
                     LOG.info("layer_stats | %s", k_stats)
-                if eval_refine_stats:
-                    LOG.info("eval_refinement | %s", eval_refine_stats)
                 if stale_evals >= cfg.plateau_patience_evals:
                     LOG.warning(
                         "Plateau detected | stale_evals=%d | val_ce_delta_window=%.4f | avg_gnorm_window=%.2e | lr=%.2e | clip_hit=%s",

@@ -1,636 +1,284 @@
-# K-Operators: K-Stack Language Model
+# K-Operators: K-Stack Language Model (V2)
 
-This directory contains a self-contained language model built around a custom K-Stack backbone.  
-It supports:
+This branch is the current V2 line of development for the K-Stack language model.
 
-- training on Tiny Shakespeare or WikiText-2,
-- character or SentencePiece tokenization,
-- factorized token embeddings with `--emb-dim`,
-- adaptive softmax output heads for larger vocabularies,
-- deterministic evaluation (cross-entropy/perplexity),
-- checkpoint save/resume/load,
-- text sampling with top-k/top-p/repetition controls,
-- optional `torch.compile`,
-- strict reproducibility mode.
+It is no longer trying to preserve the old V1 architecture:
 
-Archive: [K-Operators: A Linear-Time Sequence Mixer
-with Learned Decayed Positional Kernels](https://zenodo.org/records/19136398)
+- no equilibrium / refinement loop
+- no V1 checkpoint compatibility
+- one active model family built around the single-pass K-Stack
+- modular registries for datasets, tokenizers, heads, decay backends, `k_base` backends, and ROSA backends
 
-Archive: [Kernels might be what you need](https://zenodo.org/records/19004569)
+Historical branch material:
 
-## Results
+- [README_v1.md](README_v1.md)
+- [RESULTS_V1.md](RESULTS_V1.md)
 
-### Paper v2 ablations (March 2026)
+## What changed in V2
 
-Source: `k_operators_paper_v2.tex` (March 2026 revision).
+### 1. The model is V2-only now
 
-- Recommended config from ablations: enable `K_base`, use uncapped gamma (`0.15 <= gamma <= 0.995`), disable refinement (`--refine-steps 0`).
+The active model surface is:
 
-WikiText-2 ablation (SentencePiece vocab 8192, 25K steps, `d-model=256`, `rank=32`, `window=512`):
+- [model.py](k_language_model/model.py): public composition / re-export layer
+- [kstack.py](k_language_model/kstack.py): `K2Layer`, `KStack`, `KStackModel`
+- [layers.py](k_language_model/layers.py): `K0Layer`, `K1Layer`, `MLP`, `RMSNorm`
 
-| Configuration | K_base | Shared K_base | Params | Val PPL |
-|---|:---:|:---:|---:|---:|
-| Full (shared K_base, 5 seeds) | yes | yes | 4.08M | **19.99 ± 0.09** |
-| Full (per-layer K_base) | yes | no | 5.39M | 19.89 |
-| No K_base (`d=256`) | no | no | 3.82M | 20.59 |
-| No K_base (`d=304`, capacity control) | no | no | ~5.4M | 20.99 |
-| Original (capped `gamma >= 0.85`, with refinement) | yes | no | 3.79M | 22.33 |
+The old iterative equilibrium path and its refine-step flags were removed. V2 is a direct recurrent-style K-Stack without the extra inner loop.
 
-Tiny Shakespeare ablation (character-level vocab 65, `d-model=128`, `rank=32`, `window=256`):
+### 2. `k_base` is local instead of dense
 
-| K_base | Refinement | Gamma range | Val PPL | Notes |
-|:---:|:---:|:---:|---:|---|
-| yes | no | uncapped (`gamma >= 0.15`) | **4.55** | Best configuration |
-| yes | no | capped (`gamma >= 0.85`) | 4.67 |  |
-| no | no | uncapped (`gamma >= 0.15`) | 4.78 |  |
-| no | yes | uncapped (`gamma >= 0.15`) | 4.73 |  |
-| yes | yes | capped (`gamma >= 0.85`) | 4.74 | Original configuration |
+V1 used a dense window-sized `k_base` matrix. V2 replaced that with a local causal kernel implemented in [kbase.py](k_language_model/kbase.py).
 
-Component effects from the paper (positive is better):
+Current default:
 
-| Component | WikiText-2 ΔPPL | Tiny Shakespeare ΔPPL |
-|---|---:|---:|
-| Gamma uncapping (`0.15 <= gamma`) | +2.44 | +0.12 |
-| Add `K_base` (vs equal-capacity no-`K_base`) | +1.00 | +0.23 |
-| Share `K_base` (vs per-layer) | -0.10 | n/a |
-| Enable refinement (`eta > 0`) | -0.3 to -0.5 | -0.06 to -0.19 |
+- `k_base_impl=conv`
+- `k_base_kernel_size=8`
 
-### Historical checkpoint evals (March 13-15, 2026)
+Why this changed:
 
-WikiText-2 SentencePiece checkpoint evals (run on March 15, 2026):
+- it matches the learned behavior better
+- it removes the `O(W^2)` parameterization for the corrective term
+- it lets window length scale without making `k_base` itself grow with `W`
 
-- Dataset/tokenizer: `--dataset wikitext2 --tokenizer sentencepiece --sp-model data/tokenizers/wikitext2_unigram_8192.model --sp-vocab-size 8192`
-- Shared head/refinement flags: `--head-mode adaptive --adaptive-cutoffs 1024,4096 --adaptive-div-value 4 --emb-dim 64 --refine-steps 1`
-- Eval note: reevaluated on `cuda` with `decay_impl=block` for lower eval memory. Batch size was `8` for `window=1024` and `32` otherwise.
+In practice, `k_base` is now treated as the local correction / derivative-like path, while the decay path remains the main temporal memory path.
 
-| Step | Window | d-model | emb-dim | n-k2 | Rank | Params | Val CE | Val PPL |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 20000 | 512 | 128 | 64 | 8 | 32 | 3,790,353 | 3.1059 | 22.33 |
-| 7500 | 512 | 256 | 64 | 6 | 32 | 5,392,077 | 3.1148 | 22.53 |
-| 19750 | 512 | 128 | 64 | 6 | 32 | 3,084,237 | 3.1204 | 22.66 |
-| 19500 | 512 | 128 | 64 | 6 | 32 | 3,084,237 | 3.1344 | 22.97 |
-| 20000 | 1024 | 128 | 64 | 6 | 32 | 7,802,829 | 3.1452 | 23.22 |
-| 17250 | 512 | 128 | 64 | 6 | 32 | 3,084,237 | 3.1458 | 23.24 |
-| 11750 | 512 | 128 | 64 | 6 | 64 | 3,133,581 | 3.1563 | 23.48 |
-| 5500 | 512 | 256 | 64 | 6 | 32 | 5,392,077 | 3.1601 | 23.57 |
-| 14750 | 512 | 128 | 64 | 6 | 32 | 3,084,237 | 3.1622 | 23.62 |
-| 6500 | 512 | 128 | 64 | 6 | 64 | 3,133,581 | 3.2136 | 24.87 |
-| 7500 | 512 | 128 | 64 | 6 | 32 | 3,084,237 | 3.2190 | 25.00 |
-| 5750 | 512 | 128 | 64 | 6 | 32 | 3,084,237 | 3.2565 | 25.96 |
+### 3. The codebase is split by responsibility
 
-Synthetic denoising benchmark (run on March 15, 2026):
+The branch is now organized around extension points instead of one giant model file:
 
-- Script/flags: `python bench_denoise.py --backbone both --steps 500 --deterministic --no-tf32`
-- Task: synthetic motif-and-copy token denoising with loss and accuracy measured only on corrupted positions.
-- Takeaway: the single `K2Layer` beats the single `Conv1d` block on denoising quality at lower parameter count, but `Conv1d` remains faster.
+- [dataset_loaders.py](k_language_model/dataset_loaders.py): dataset presets and corpus materialization
+- [tokenizers.py](k_language_model/tokenizers.py): tokenizer classes
+- [dataset_pipeline.py](k_language_model/dataset_pipeline.py): train/val loading, split logic, tokenizer build, tensorization
+- [heads.py](k_language_model/heads.py): linear / GELU / adaptive heads
+- [decay.py](k_language_model/decay.py): pluggable decay implementations
+- [kbase.py](k_language_model/kbase.py): pluggable `k_base` implementations
+- [rosa_backends.py](k_language_model/rosa_backends.py): pluggable ROSA backends
+- [model_factory.py](k_language_model/model_factory.py): model assembly from config
+- [configs.py](k_language_model/configs.py): typed dataset/model config objects
+- [cli_args.py](k_language_model/cli_args.py): shared CLI argument groups
 
-| Mixer | Params | Val CE | Val Acc | tok/s |
-|---|---:|---:|---:|---:|
-| `Conv1d` | 12,528 | 2.7190 | 0.1376 | 324,310 |
-| `K2` | 11,034 | 2.0492 | 0.3526 | 192,995 |
+Each pluggable family is keyed by a string name and registered by class. The class defines its own `name`, and the builder resolves it through the registry.
 
+## Architecture summary
 
-Post pre-print update (March 14th 2026):
+The active model is a token-level language model built around a K-Stack:
 
-- Preliminary results on character-level WikiText-2. Hyperparameter sweeps and ablations are pending. Before moving to sentencepiece-level, I want to ensure the model is well-understood and tuned at the char level.
-- Shared flags: `--dataset wikitext2 --deterministic --no-tf32 --skip-sample --n-k2 6 --head-mode gelu --head-mult 1 --rank 32 --refine-steps 1`
-- Runtime/device: `mps`
+1. token embedding
+2. optional embedding projection into `d_model`
+3. `KStack`
+4. final normalization
+5. output head
 
-| Checkpoint                   | Step | Val BPC | Val PPL | Window | d-model | Params | Run hash |
-|------------------------------|---:|---:|---:|---:|---:|---:|---|
-| `models/wiki_256_256_10k.pt` | 10000 | 1.4978 | 2.82 | 256 | 256 | 3,337,421 | `9226ddba588c` |
-| `models/wiki_256_256_20k.pt` | 20000 | 1.4535 | 2.74 | 256 | 256 | 3,337,421 | `9ef711bf3282` |
-| `models/wiki_512_256_20k.pt` | 20000 | 1.4208 | 2.68 | 512 | 256 | 4,517,069 | `d67d459388a0` |
-| `models/wiki_512_128_20k.pt` | 20000 | 1.5306 | 2.89 | 512 | 128 | 2,373,325 | `5d6d1f245439` |
+Inside the stack:
 
-Tiny Shakespeare seed-sweep deterministic evals (run on March 13, 2026):
+- `K1` front layer
+- `n_k2` copies of `K2Layer`
+- `K1` tail layer
+- `K0` readout layer
 
-- Flags: `--deterministic --no-tf32 --skip-sample`
-- Sweep architecture flags: `--d-model 128 --window 256 --n-k2 6 --head-mode gelu --head-mult 1 --rank 32 --refine-steps 1`
-- Checkpoint directory: `data/20260313_133317_26319`
+Inside `K2Layer`:
 
-| Checkpoint | Step | Val CE | Val PPL |
-|---|---:|---:|---:|
-| `run_1_seed_42.pt` | 3250 | 1.4838 | 4.41 |
-| `run_2_seed_42.pt` | 3250 | 1.4811 | 4.40 |
-| `run_3_seed_42.pt` | 2750 | 1.4876 | 4.43 |
-| `run_4_seed_69.pt` | 3000 | 1.5046 | 4.50 |
-| `run_5_seed_420.pt` | 3500 | 1.4878 | 4.43 |
-| `run_6_seed_666.pt` | 3250 | 1.4980 | 4.47 |
-| `run_7_seed_2137.pt` | 3250 | 1.4733 | 4.36 |
+- `k_base` branch: local causal correction
+- decay branch: rank-wise learned timescale mixing
+- optional ROSA branch
+- projection + residual
+- MLP sub-block
 
-Aggregate over the 7-run sweep:
+## ROSA (Rapid Online Suffix Automation)
 
-- Mean val CE: `1.4880` (std `0.0097`)
-- Mean val PPL: `4.4286` (std `0.0426`)
-- Best checkpoint: `run_7_seed_2137.pt` with `val_ce=1.4733`, `val_ppl=4.36`
+ROSA lives in [rosa_backends.py](k_language_model/rosa_backends.py) and [rosa.py](k_language_model/rosa.py). Available backends are `off`, `exact`, `gpu_approx`, and `auto`.
 
-Reference checkpoint (`models/char_shakespeare.pt`) deterministic eval with matching architecture:
+The `exact` implementation is derived from the RWKV-v8 ROSA pseudocode. This repo also has an optional native helper in [rosa_ext.cpp](k_language_model/rosa_ext.cpp) for the exact batch path.
 
-- `val_ce=1.4773`
-- `val_ppl=4.38`
+The main architectural difference is injection point:
 
-Reproduce one eval:
+- RWKV-v8 applies ROSA at the embedding / input side.
+- This repo computes `rosa_h` once and injects it into the selected K2 mixing layers, where each receiving layer gates the contribution with its learned `rho` term.
+
+Sources:
+
+- [RWKV-v8 ROSA directory](https://github.com/BlinkDL/RWKV-LM/tree/main/RWKV-v8)
+- [RWKV-8 note](https://github.com/BlinkDL/RWKV-LM/blob/main/RWKV-8.md)
+
+## Data and tokenizers
+
+Built-in dataset presets:
+
+- `shakespeare`
+- `full-shakespeare`
+- `full-shakespeare-clean`
+- `wikitext2`
+- `wikitext2_raw`
+
+Tokenizer options:
+
+- `char`
+- `byte`
+- `sentencepiece`
+
+Relevant V2 data changes:
+
+- raw-directory corpora can be merged automatically
+- `full-shakespeare-clean` strips Folger front matter and other boilerplate
+- byte tokenization preserves raw file bytes
+- SentencePiece training now uses the train split only instead of fitting on the unsplit source text
+
+Active data entrypoint:
+
+- [data.py](k_language_model/data.py) is intentionally thin
+- most dataset/tokenizer work now lives in [dataset_pipeline.py](k_language_model/dataset_pipeline.py)
+
+## Heads
+
+The output head is no longer hardwired.
+
+Available implementations in [heads.py](k_language_model/heads.py):
+
+- `linear`
+- `gelu`
+- `adaptive`
+
+The head module also owns state-dict adaptation for older V2 checkpoint key layouts.
+
+## Decay implementations
+
+Decay backends live in [decay.py](k_language_model/decay.py):
+
+- `mask`: baseline dense causal-mask implementation
+- `block`: lower-memory block recurrence
+- `kernel`: experimental Triton/CUDA path with fallback
+
+The active CLI still exposes the same `--decay-impl` knob, but the implementation is now selected through the registry instead of being hardcoded into the model.
+
+## UI app
+
+The local UI is a FastAPI queue for scheduling train and infer runs.
+
+Relevant files:
+
+- [ui_app.py](k_language_model/ui_app.py): web app and inline UI
+- [ui_backend.py](k_language_model/ui_backend.py): queue, command building, structured progress parsing
+
+Current UI behavior:
+
+- one page, tabbed train / infer forms
+- FIFO queue with a single worker
+- structured progress cards instead of raw log spam
+- command copy and cancel controls
+- checkpoint-aware inputs
+- optional extra CLI args when a field is not surfaced yet
+
+Run it with:
 
 ```bash
-python infer.py \
-  --ckpt data/20260313_133317_26319/run_7_seed_2137.pt \
-  --deterministic --no-tf32 --skip-sample \
-  --d-model 128 --window 256 --n-k2 6 \
-  --head-mode gelu --head-mult 1 --rank 32 --refine-steps 1
+pip install -e .[ui]
+python -m k_language_model.ui_app --host 127.0.0.1 --port 8000
 ```
 
-Note: TF32 affects CUDA kernels only. On CPU/MPS runs, `--no-tf32` has no practical effect.
+If your editable install scripts are on `PATH`, this also works:
 
-## Contents
-
-- [Results](#results)
-- [Project Layout](#project-layout)
-- [Quick Start](#quick-start)
-- [Training](#training)
-- [Evaluation and Inference](#evaluation-and-inference)
-- [Sampling Controls](#sampling-controls)
-- [Model Architecture](#model-architecture)
-- [Reproducibility and Runtime Behavior](#reproducibility-and-runtime-behavior)
-- [Checkpoints](#checkpoints)
-- [CLI Reference](#cli-reference)
-- [Troubleshooting](#troubleshooting)
-- [License](#license)
-
-## Project Layout
-
-```text
-k_operators/
-├── train.py                      # Main training entrypoint
-├── infer.py                      # Main inference/eval entrypoint
-├── k_lm.py                       # Backward-compatible alias to train.py
-├── k_language_model/
-│   ├── train_app.py              # Training CLI and orchestration
-│   ├── infer_app.py              # Inference/eval CLI and orchestration
-│   ├── trainer.py                # Train loop, eval loop, optimizer/scheduler
-│   ├── model.py                  # K-Stack model definition
-│   ├── generation.py             # Text sampling implementation
-│   ├── checkpoint.py             # Save/load logic (model + optimizer)
-│   ├── data.py                   # Dataset download/loading + char/SentencePiece tokenization
-│   └── runtime.py                # Device, AMP, logging, reproducibility
-├── data/
-│   ├── input.txt                 # Tiny Shakespeare dataset cache
-│   └── wikitext-2/               # WikiText-2 cache (auto-downloaded when used)
-├── models/
-│   └── char_shakespeare.pt       # Example trained checkpoint
-└── configs/
-    └── colab_seed_sweep.sh       # Optional Colab seed sweep script
+```bash
+k-lm-ui --host 127.0.0.1 --port 8000
 ```
 
-## Quick Start
+## Quick start
 
-### 1) Environment
+### Install
 
-Minimum runtime dependencies (from imports):
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install --upgrade pip
+pip install -r requirements.txt
+pip install -e .
+```
 
-- Python 3.10+
-- PyTorch
-- NumPy
-- SentencePiece
+### Train
+
+`train.py` and `k_lm.py` both route to the V2 training entrypoint in [train_app.py](k_language_model/train_app.py).
 
 Example:
 
 ```bash
-cd k_operators
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
+python .\k_lm.py ^
+  --dataset shakespeare ^
+  --tokenizer byte ^
+  --window 512 ^
+  --d-model 96 ^
+  --n-k2 6 ^
+  --rank 4 ^
+  --share-k-base ^
+  --k-base-kernel-size 8 ^
+  --decay-impl mask ^
+  --rosa-impl exact ^
+  --batch-size 16 ^
+  --eval-interval 500 ^
+  --lr 1e-2 ^
+  --gamma-min 0.05 ^
+  --alpha-cap 1.0 ^
+  --ckpt runs\\byte_v2.pt
 ```
 
-Notes:
+### Infer / evaluate
 
-- The code picks device automatically: `cuda` -> `mps` -> `cpu`.
-- AMP is enabled on CUDA only.
+Inference and deterministic evaluation go through [infer_app.py](k_language_model/infer_app.py).
 
-Optional editable install (enables `k-lm-train` / `k-lm-infer` console commands):
+Example:
 
 ```bash
-pip install -e .
+python .\infer.py ^
+  --ckpt runs\\byte_v2.pt ^
+  --dataset shakespeare ^
+  --tokenizer byte ^
+  --window 512 ^
+  --d-model 96 ^
+  --n-k2 6 ^
+  --rank 4 ^
+  --share-k-base ^
+  --k-base-kernel-size 8 ^
+  --decay-impl mask ^
+  --rosa-impl exact ^
+  --prompt "KING:\nExplain the nature of time in simple words."
 ```
-
-Synthetic denoising benchmark (single `Conv1d` block vs single `K2Layer`):
-
-```bash
-python bench_denoise.py \
-  --backbone both \
-  --steps 300
-```
-
-This benchmark is intentionally small and synthetic. It generates motif-and-copy token sequences, corrupts spans/tokens, and trains both models to reconstruct the original tokens only at corrupted positions.
-
-The defaults are tuned to be easy enough to learn quickly. To stress longer-range denoising, raise `--period-max`, `--burst-count`, `--burst-max-len`, or `--seq-len`.
-
-### 2) First training run
-
-```bash
-cd k_operators
-python train.py \
-  --steps 2000 \
-  --eval-interval 200 \
-  --ckpt models/char_shakespeare.pt \
-  --sample
-```
-
-What happens:
-
-- Tiny Shakespeare is auto-downloaded to `data/input.txt` if missing.
-- Training runs and logs train CE / val CE / val PPL regularly.
-- Checkpoint is saved only when validation perplexity improves.
-- A text sample is printed at the end because `--sample` is enabled.
-
-## Training
-
-`train.py` is the main entrypoint. It handles:
-
-- full training loop,
-- optional checkpoint resume,
-- periodic deterministic eval,
-- optional post-training sample generation.
-
-### Resume training from checkpoint
-
-If `--ckpt` points to an existing file, training resumes from it:
-
-```bash
-python train.py --ckpt models/char_shakespeare.pt
-```
-
-### Evaluate only (no training)
-
-```bash
-python train.py \
-  --eval-only \
-  --ckpt models/char_shakespeare.pt
-```
-
-Optional: override eval-time refinement depth:
-
-```bash
-python train.py \
-  --eval-only \
-  --ckpt models/char_shakespeare.pt \
-  --eval-refine-steps 2
-```
-
-### Useful training flags
-
-- Dataset/input: `--dataset {shakespeare,wikitext2,wikitext2_raw}`, `--data-path`, `--val-path`, `--val-frac`, `--tokenizer`
-- SentencePiece: `--sp-model`, `--sp-vocab-size`, `--sp-model-type`, `--sp-character-coverage`, `--sp-split-digits`, `--sp-byte-fallback`
-- Model shape: `--window`, `--d-model`, `--emb-dim`, `--rank`, `--k-base-rank`, `--k-base-impl`, `--share-k-base`/`--no-share-k-base`, `--n-k2`, `--head-mode`, `--head-mult`
-- Adaptive head: `--adaptive-cutoffs`, `--adaptive-div-value`
-- Refinement behavior: `--refine-steps`, `--train-refine-steps`, `--alpha-cap`, `--decay-impl`
-- Optimization: `--lr`, `--lr-floor`, `--warmup-steps`, `--weight-decay`, `--optimizer-mode`
-- Regularization: `--emb-dropout`, `--mlp-dropout`, `--residual-dropout`, `--head-dropout`
-- CUDA perf: `--fused-adamw`, `--compile`, `--compile-mode`
-- Reproducibility: `--seed`, `--deterministic`, `--strict-repro`, `--run-manifest`
-- Extra logging: `--diagnostics` for verbose research/debug stats
-
-### WikiText-2 training
-
-Built-in WikiText-2 preset:
-
-```bash
-python train.py \
-  --dataset wikitext2 \
-  --steps 3500 \
-  --window 256 \
-  --d-model 128 \
-  --n-k2 6 \
-  --rank 32 \
-  --head-mode gelu \
-  --head-mult 1 \
-  --refine-steps 1 \
-  --ckpt models/wiki_text2.pt
-```
-
-Raw WikiText-2 preset (uses `wiki.train.raw` / `wiki.valid.raw` and avoids the literal `<unk>` artifacts present in the processed split):
-
-```bash
-python train.py \
-  --dataset wikitext2_raw \
-  --steps 3500 \
-  --window 256 \
-  --d-model 128 \
-  --n-k2 6 \
-  --rank 32 \
-  --head-mode gelu \
-  --head-mult 1 \
-  --refine-steps 1 \
-  --ckpt models/wiki_text2_raw.pt
-```
-
-SentencePiece + adaptive softmax preset:
-
-```bash
-python train.py \
-  --dataset wikitext2 \
-  --tokenizer sentencepiece \
-  --sp-model data/tokenizers/wikitext2_unigram_8192.model \
-  --sp-vocab-size 8192 \
-  --window 256 \
-  --d-model 256 \
-  --emb-dim 64 \
-  --n-k2 6 \
-  --rank 32 \
-  --head-mode adaptive \
-  --adaptive-cutoffs 1024,4096 \
-  --refine-steps 1 \
-  --ckpt models/wiki_text2_sp_adaptive.pt
-```
-
-Notes:
-
-- If `--sp-model` does not exist during training, it is trained automatically from the training split and written under `data/tokenizers/`.
-- When `--head-mode adaptive` is enabled, token ids are remapped by train-set frequency so the adaptive shortlist receives the most common tokens first.
-
-Custom text files:
-
-```bash
-python train.py \
-  --dataset wikitext2 \
-  --data-path /path/to/train.txt \
-  --val-path /path/to/valid.txt \
-  --ckpt models/wiki_text2_custom.pt
-```
-
-Colab sweep script supports dataset env vars too:
-
-```bash
-DATASET="wikitext2" \
-TRAIN_DATA_PATH="/content/data/wiki_train.txt" \
-VAL_DATA_PATH="/content/data/wiki_valid.txt" \
-SCRIPT_PATH="train.py" \
-bash configs/colab_seed_sweep.sh
-```
-
-## Evaluation and Inference
-
-Use `infer.py` to load a checkpoint and run deterministic eval and/or sampling.
-
-### Default inference flow (eval + sample)
-
-```bash
-python infer.py --ckpt models/char_shakespeare.pt
-```
-
-### Sample only (skip eval)
-
-```bash
-python infer.py \
-  --ckpt models/char_shakespeare.pt \
-  --skip-eval \
-  --prompt "ROMEO:" \
-  --sample-tokens 300
-```
-
-### Eval only (skip sample)
-
-```bash
-python infer.py \
-  --ckpt models/char_shakespeare.pt \
-  --skip-sample
-```
-
-Important: dataset + tokenizer context must match the checkpoint.
-
-- Architecture arguments (`--window`, `--d-model`, `--emb-dim`, `--rank`, `--k-base-rank`, `--k-base-impl`, `--share-k-base`/`--no-share-k-base`, `--n-k2`, head/refinement flags) must match.
-- Dataset/tokenizer arguments (`--dataset`, `--data-path`, `--val-path`, `--val-frac`, `--tokenizer`, SentencePiece flags) should match what was used when training the checkpoint.
-- Reporting mode: WikiText-2 logs use BPC only for char-tokenized runs. SentencePiece runs report token CE and token PPL.
-
-## Sampling Controls
-
-Both training (`--sample`) and inference support the same generation controls:
-
-- `--prompt`: seed text
-- `--sample-tokens`: number of generated tokens
-- `--temperature`: logits temperature (lower = more deterministic)
-- `--top-k`: keep top-k logits (0 disables)
-- `--top-p`: nucleus sampling threshold in `(0, 1)` (0 disables)
-- `--repetition-penalty`: >1 discourages repeated tokens
-- `--repetition-window`: lookback window for repetition penalty (`0` = full context)
-- `--prompt-lock-tokens`: keep first N prompt tokens in long-context conditioning
-
-## Model Architecture
-
-The model is defined in `k_language_model/model.py`.
-
-High-level structure:
-
-1. Token embedding (`--emb-dim` can be smaller than `--d-model`)
-2. K-Stack backbone:
-   - `K1` block
-   - `n_k2` x `K2` blocks
-   - `K1` block
-   - `K0` block
-3. Final RMSNorm
-4. Output head:
-   - `linear` head (tied embedding weights, optionally through a projection when `--emb-dim != --d-model`),
-   - `gelu` MLP head, or
-   - `adaptive` softmax head for larger vocabularies
-
-### K2 block summary
-
-Each K2 layer mixes sequence information with two components:
-
-- learned causal base kernel (`k_base`),
-- low-rank decayed recurrent interaction (`u`, `v`, `decay_logit`, `alpha_logit`).
-
-Three decay implementations are available:
-
-- `mask` (default): fastest, more memory-heavy
-- `block`: lower memory, uses blocked scan
-- `kernel`: experimental Triton CUDA backend (falls back to `block` when unsupported)
-
-Low-rank `k_base` execution modes (`--k-base-impl`):
-
-- `auto` (default): chooses fused path on CUDA when temporary tensor size is safe, otherwise uses scan
-- `fused`: force fused path (typically fastest on CUDA, higher temporary memory)
-- `scan`: force scan path (lowest temporary memory; typical choice for CPU/MPS)
-
-### Iterative refinement
-
-At each forward pass (unless refinement steps are set to `0`), hidden states are iteratively updated:
-
-```text
-h <- h + eta * (KStack(h) - h)
-```
-
-- `eta` is learned (`eta_logit`).
-- `--train-refine-steps` controls training-time iterations.
-- `--refine-steps` controls eval/inference iterations.
-
-## Reproducibility and Runtime Behavior
-
-Runtime behavior is managed in `k_language_model/runtime.py`.
-
-- Device selection: CUDA first, then MPS, then CPU.
-- AMP: enabled on CUDA (`bfloat16` autocast path).
-- Default mode favors speed, not strict determinism.
-
-### Determinism controls
-
-- `--deterministic`: enables deterministic algorithms and deterministic cuDNN behavior.
-- `--deterministic-warn-only`: warn instead of error for nondeterministic ops.
-- `--no-tf32`: disables TF32.
-- `--strict-repro`: strongest reproducibility mode; forces deterministic settings, disables TF32, disables compile, and disables fused AdamW.
-
-### Run manifest
-
-Use `--run-manifest path/to/manifest.json` to persist:
-
-- command line,
-- hashed config signature,
-- full args,
-- runtime metadata (Python, platform, torch/cuda/cudnn, device flags).
 
 ## Checkpoints
 
-Checkpoint logic is in `k_language_model/checkpoint.py`.
+Checkpoint save/load lives in [checkpoint.py](k_language_model/checkpoint.py).
 
-Saved format:
+Important note:
 
-```python
-{
-  "step": int,
-  "best_ppl": float,
-  "model": model.state_dict(),
-  "optimizer": optimizer.state_dict(),
-  "rng_state": {
-    "torch_cpu": ...,
-    "torch_cuda": ...,
-    "numpy": ...,
-    "python": ...,
-  },
-}
-```
+- V1 compatibility is intentionally dropped on this branch
+- current checkpoints are expected to match the modular V2 architecture
 
-Behavior:
+The loader still handles internal V2 key migrations where practical, such as split head layouts.
 
-- Training resume (`load_checkpoint`) restores model + optimizer when available.
-- Training resume restores RNG state when available, improving reproducibility after interruptions.
-- Inference load (`load_model_checkpoint`) restores model only.
-- Checkpoint loader normalizes some prefixes (`_orig_mod.`, `module.`) for compatibility.
-- State-dict load uses `strict=False` and logs missing/unexpected keys.
-- Shape mismatches (for example wrong `d-model`/`window`/`n-k2`) still raise a hard load error.
+## Extending the system
 
-## CLI Reference
+If you want to add a new backend or data path, the intended route is to add a class and register it.
 
-Use full help for exact defaults and descriptions:
+Current extension surfaces:
 
-```bash
-python train.py --help
-python infer.py --help
-```
+- dataset loaders in [dataset_loaders.py](k_language_model/dataset_loaders.py)
+- tokenizers in [tokenizers.py](k_language_model/tokenizers.py)
+- heads in [heads.py](k_language_model/heads.py)
+- decay backends in [decay.py](k_language_model/decay.py)
+- `k_base` backends in [kbase.py](k_language_model/kbase.py)
+- ROSA backends in [rosa_backends.py](k_language_model/rosa_backends.py)
 
-### Mode reference (all mode-valued flags)
+The training and inference CLIs consume those modules through shared config objects and [model_factory.py](k_language_model/model_factory.py), so adding a backend later should not require another repo-wide refactor.
 
-| Flag | Choices | Default | Scope |
-|---|---|---|---|
-| `--dataset` | `shakespeare`, `wikitext2`, `wikitext2_raw` | `shakespeare` | train + infer |
-| `--tokenizer` | `char`, `sentencepiece` | `char` | train + infer |
-| `--sp-model-type` | `unigram`, `bpe`, `char`, `word` | `unigram` | train + infer |
-| `--head-mode` | `linear`, `gelu`, `adaptive` | `linear` | train + infer |
-| `--k-base-impl` | `auto`, `fused`, `scan` | `auto` | train + infer |
-| `--decay-impl` | `mask`, `block`, `kernel` | `mask` | train + infer |
-| `--optimizer-mode` | `simple`, `grouped` | `grouped` | train only |
-| `--compile-mode` | `default`, `reduce-overhead`, `max-autotune` | `default` | train + infer |
+## Console commands
 
-Notes:
+Editable install scripts from [pyproject.toml](pyproject.toml):
 
-- `--optimizer-mode grouped` uses specialized param groups (`core`, `bias`, `norm`, `emb`, `k_logit`) with per-group LR multipliers; `simple` uses standard `decay`/`no_decay` grouping.
-- `--decay-impl kernel` is CUDA/Triton-oriented and falls back to `block` if unavailable.
-
-### `train.py` (selected high-impact args)
-
-- Core: `--steps`, `--batch-size`, `--eval-interval`, `--ckpt`
-- Dataset: `--dataset`, `--data-path`, `--val-path`, `--val-frac`, `--tokenizer`
-- SentencePiece: `--sp-model`, `--sp-vocab-size`, `--sp-model-type`, `--sp-character-coverage`, `--sp-split-digits`, `--sp-byte-fallback`
-- Model: `--window`, `--d-model`, `--emb-dim`, `--rank`, `--k-base-rank`, `--k-base-impl`, `--share-k-base`/`--no-share-k-base`, `--n-k2`, `--head-mode`, `--head-mult`, `--head-dropout`
-- Adaptive: `--adaptive-cutoffs`, `--adaptive-div-value`
-- Refinement/decay: `--refine-steps`, `--train-refine-steps`, `--alpha-cap`, `--decay-impl`
-- Optimizer/schedule: `--lr`, `--lr-floor`, `--warmup-steps`, `--beta1`, `--beta2`, `--weight-decay`, `--optimizer-mode`
-- Perf: `--fused-adamw` / `--no-fused-adamw`, `--compile`, `--compile-mode`
-- Repro: `--seed`, `--deterministic`, `--deterministic-warn-only`, `--no-tf32`, `--strict-repro`, `--run-manifest`
-- Eval-only path: `--eval-only`, `--eval-refine-steps`
-- Sampling: `--sample`, `--prompt`, `--sample-tokens`, `--temperature`, `--top-k`, `--top-p`, `--repetition-penalty`, `--repetition-window`, `--prompt-lock-tokens`
-
-### `infer.py` (selected high-impact args)
-
-- Required: `--ckpt`
-- Dataset: `--dataset`, `--data-path`, `--val-path`, `--val-frac`, `--tokenizer`
-- SentencePiece: `--sp-model`, `--sp-vocab-size`, `--sp-model-type`, `--sp-character-coverage`, `--sp-split-digits`, `--sp-byte-fallback`
-- Eval: `--batch-size`, `--skip-eval`
-- Sampling: `--skip-sample`, `--prompt`, `--sample-tokens`, `--temperature`, `--top-k`, `--top-p`, `--repetition-penalty`, `--repetition-window`, `--prompt-lock-tokens`
-- Architecture compatibility: `--window`, `--d-model`, `--emb-dim`, `--rank`, `--k-base-rank`, `--k-base-impl`, `--share-k-base`/`--no-share-k-base`, `--n-k2`, `--head-*`, `--adaptive-*`, `--refine-steps`, `--train-refine-steps`, `--eval-refine-steps`, `--alpha-cap`, `--decay-impl`
-- Runtime/repro: `--compile`, `--compile-mode`, `--seed`, `--deterministic`, `--strict-repro`
-
-## Troubleshooting
-
-### Out-of-memory (OOM)
-
-Reduce one or more of:
-
-- `--batch-size`
-- `--window`
-- `--d-model`
-- `--emb-dim`
-- `--n-k2`
-
-If needed, switch decay backend to lower-memory mode:
-
-```bash
---decay-impl block
-```
-
-### `torch.compile` fails with `TritonMissing`
-
-On Windows CUDA setups, `torch.compile` may be unavailable because there is no working Triton package for the environment. The CLI now warns and falls back to eager mode instead of crashing.
-
-If you want the old behavior explicitly, just omit `--compile`.
-
-### Checkpoint loads with many missing/unexpected keys
-
-Most likely architecture mismatch. Ensure the checkpoint is loaded with the same:
-
-- `window`, `d-model`, `emb-dim`, `rank`, `n-k2`
-- tokenizer settings, especially SentencePiece model path and vocab size
-- head mode/mult/dropout and adaptive cutoff settings when applicable
-- refine/decode related flags as required for shape compatibility
-- dataset and text sources (`--dataset`, `--data-path`, `--val-path`, `--val-frac`) to keep vocab consistent
-
-### Reproducibility drift between runs
-
-Use:
-
-```bash
---strict-repro --seed <fixed_seed>
-```
-
-and avoid changing runtime stack (PyTorch/CUDA version, hardware, driver).
-
-### NumPy 2 compatibility warning
-
-If you see a warning about modules compiled for NumPy 1.x not running under NumPy 2.x, reinstall with:
-
-```bash
-pip install -r requirements.txt
-```
-
-This project pins `numpy<2` to stay compatible with common PyTorch builds.
-
-### No checkpoint file created
-
-A checkpoint is written only when:
-
-- `--ckpt` is provided, and
-- validation perplexity improves at an evaluation step.
+- `k-lm-train`
+- `k-lm-infer`
+- `k-lm-bench-denoise`
+- `k-lm-sequence-predict`
+- `k-lm-sequence-stats`
+- `k-lm-ui`
 
 ## License
 
-This project uses the MIT License. See `LICENSE`.
+[LICENSE](LICENSE)

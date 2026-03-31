@@ -1,14 +1,14 @@
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 
-from .data import TextTokenizer
-from .model import KStackModel
+from .tokenizers import TextTokenizer
 from .runtime import DEVICE, _unwrap_model
 
 
 @torch.no_grad()
 def sample_text(
-    model: KStackModel,
+    model: nn.Module,
     tokenizer: TextTokenizer,
     prompt: str,
     max_new_tokens: int,
@@ -67,6 +67,13 @@ def sample_text(
             remove_mask.scatter_(1, sorted_indices, sorted_remove_mask)
             scores = scores.masked_fill(remove_mask, float("-inf"))
         probs = F.softmax(scores, dim=-1)
+        prob_sums = probs.sum(dim=-1)
+        if (not torch.isfinite(probs).all()) or (prob_sums <= 0).any():
+            raise RuntimeError(
+                "Sampling probabilities became invalid before multinomial "
+                f"(finite={bool(torch.isfinite(probs).all().item())}, "
+                f"min_sum={float(torch.nan_to_num(prob_sums, nan=0.0).min().item()):.6f})."
+            )
         next_id = torch.multinomial(probs, num_samples=1)
         x = torch.cat([x, next_id], dim=1)
 

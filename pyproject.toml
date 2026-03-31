@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "k-language-model"
 version = "0.1.0"
-description = "K-Stack character-level language model"
+description = "K-Stack token-level language model"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -15,10 +15,19 @@ dependencies = [
   "torch>=2.1",
 ]
 
+[project.optional-dependencies]
+ui = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+]
+
 [project.scripts]
 k-lm-train = "k_language_model.train_app:main"
 k-lm-infer = "k_language_model.infer_app:main"
 k-lm-bench-denoise = "k_language_model.denoise_bench:main"
+k-lm-sequence-predict = "k_language_model.sequence_prediction:main"
+k-lm-sequence-stats = "k_language_model.sequence_prediction_stats:main"
+k-lm-ui = "k_language_model.ui_app:main"
 
 [tool.setuptools]
 packages = ["k_language_model"]

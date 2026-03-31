@@ -31,15 +31,24 @@ def _restore_rng_state(state: object) -> bool:
     restored = False
     torch_cpu = state.get("torch_cpu")
     if torch_cpu is not None:
-        torch.random.set_rng_state(torch_cpu)
-        restored = True
+        torch_cpu_tensor = _coerce_rng_tensor(torch_cpu)
+        if torch_cpu_tensor is not None:
+            try:
+                torch.random.set_rng_state(torch_cpu_tensor)
+                restored = True
+            except (RuntimeError, TypeError, ValueError) as exc:
+                LOG.warning("CPU RNG state not restored (%s). Continuing.", exc)
 
     torch_cuda = state.get("torch_cuda")
     if torch_cuda is not None and torch.cuda.is_available():
+        torch_cuda_tensors = _coerce_rng_tensor_list(torch_cuda)
+        if torch_cuda_tensors is None:
+            torch_cuda_tensors = []
         try:
-            torch.cuda.set_rng_state_all(torch_cuda)
-            restored = True
-        except RuntimeError as exc:
+            if torch_cuda_tensors:
+                torch.cuda.set_rng_state_all(torch_cuda_tensors)
+                restored = True
+        except (RuntimeError, TypeError, ValueError) as exc:
             LOG.warning("CUDA RNG state not restored (%s). Continuing.", exc)
 
     numpy_state = state.get("numpy")
@@ -53,6 +62,41 @@ def _restore_rng_state(state: object) -> bool:
         restored = True
 
     return restored
+
+
+def _coerce_rng_tensor(value: object) -> torch.Tensor | None:
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach()
+        if tensor.device.type != "cpu":
+            tensor = tensor.cpu()
+        if tensor.dtype != torch.uint8:
+            tensor = tensor.to(dtype=torch.uint8)
+        return tensor.contiguous()
+    if isinstance(value, np.ndarray):
+        return torch.as_tensor(value, dtype=torch.uint8).contiguous()
+    if isinstance(value, (bytes, bytearray)):
+        return torch.tensor(list(value), dtype=torch.uint8)
+    if isinstance(value, (list, tuple)):
+        try:
+            return torch.tensor(value, dtype=torch.uint8)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _coerce_rng_tensor_list(value: object) -> List[torch.Tensor] | None:
+    if isinstance(value, torch.Tensor):
+        tensor = _coerce_rng_tensor(value)
+        return [tensor] if tensor is not None else None
+    if not isinstance(value, (list, tuple)):
+        return None
+    tensors: List[torch.Tensor] = []
+    for item in value:
+        tensor = _coerce_rng_tensor(item)
+        if tensor is None:
+            return None
+        tensors.append(tensor)
+    return tensors
 
 
 def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer, step: int, best_ppl: float) -> None:
@@ -130,23 +174,6 @@ def _log_state_load_mismatch(missing_keys: List[str], unexpected_keys: List[str]
         LOG.warning("Checkpoint unexpected keys (%d): %s%s", len(unexpected_keys), preview, suffix)
 
 
-def _maybe_bootstrap_low_rank_k_base(model: nn.Module, missing_keys: List[str]) -> bool:
-    if not missing_keys:
-        return False
-    needs_bootstrap = any(key.endswith("w_k1.weight") or key.endswith("w_k2.weight") for key in missing_keys)
-    if not needs_bootstrap:
-        return False
-    bootstrap_fn = getattr(model, "bootstrap_low_rank_k_base", None)
-    if callable(bootstrap_fn):
-        bootstrap_fn()
-        return True
-    return False
-
-
-def _filter_bootstrapped_low_rank_missing_keys(missing_keys: List[str]) -> List[str]:
-    return [key for key in missing_keys if not (key.endswith("w_k1.weight") or key.endswith("w_k2.weight"))]
-
-
 def load_model_checkpoint(path: Path, model: nn.Module) -> Tuple[int | None, float | None]:
     # This repository stores full training snapshots (not just tensors), so weights_only=False is intentional.
     # Do not load untrusted checkpoints.
@@ -157,9 +184,6 @@ def load_model_checkpoint(path: Path, model: nn.Module) -> Tuple[int | None, flo
     incompatible = core_model.load_state_dict(state, strict=False)
     missing_keys = list(incompatible.missing_keys)
     unexpected_keys = list(incompatible.unexpected_keys)
-    if _maybe_bootstrap_low_rank_k_base(core_model, missing_keys):
-        LOG.info("Bootstrapped low-rank k_base factors from loaded dense k_base buffers.")
-        missing_keys = _filter_bootstrapped_low_rank_missing_keys(missing_keys)
     _log_state_load_mismatch(missing_keys, unexpected_keys)
     step_str = "N/A" if step is None else str(step)
     best_str = "N/A" if best_ppl is None else f"{best_ppl:.3f}"
@@ -177,9 +201,6 @@ def load_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimiz
     incompatible = core_model.load_state_dict(state, strict=False)
     missing_keys = list(incompatible.missing_keys)
     unexpected_keys = list(incompatible.unexpected_keys)
-    if _maybe_bootstrap_low_rank_k_base(core_model, missing_keys):
-        LOG.info("Bootstrapped low-rank k_base factors from loaded dense k_base buffers.")
-        missing_keys = _filter_bootstrapped_low_rank_missing_keys(missing_keys)
     _log_state_load_mismatch(missing_keys, unexpected_keys)
 
     optimizer_loaded = False

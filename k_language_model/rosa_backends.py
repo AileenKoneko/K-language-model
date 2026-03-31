@@ -13,6 +13,21 @@ from .rosa import rosa_next_token_ids_batch
 _ROSA_REGISTRY: Dict[str, Type["RosaBackend"]] = {}
 
 
+def _dynamo_disable(fn):
+    compiler_disable = getattr(getattr(torch, "compiler", None), "disable", None)
+    if callable(compiler_disable):
+        return compiler_disable(fn)
+    dynamo_disable = getattr(getattr(torch, "_dynamo", None), "disable", None)
+    if callable(dynamo_disable):
+        return dynamo_disable(fn)
+    return fn
+
+
+@_dynamo_disable
+def _rosa_next_token_ids_exact_eager(token_ids: torch.Tensor) -> torch.Tensor:
+    return rosa_next_token_ids_batch(token_ids, impl="exact")
+
+
 def register_rosa_backend(cls: Type["RosaBackend"]) -> Type["RosaBackend"]:
     if not cls.name:
         raise ValueError("RosaBackend subclasses must define a non-empty name.")
@@ -48,7 +63,7 @@ class ExactRosaBackend(RosaBackend):
     name = "exact"
 
     def next_token_ids(self, token_ids: torch.Tensor, *, vocab_size: int) -> torch.Tensor | None:
-        return rosa_next_token_ids_batch(token_ids, impl="exact")
+        return _rosa_next_token_ids_exact_eager(token_ids)
 
 
 @register_rosa_backend
@@ -69,6 +84,8 @@ class AutoRosaBackend(RosaBackend):
 
     def next_token_ids(self, token_ids: torch.Tensor, *, vocab_size: int) -> torch.Tensor | None:
         impl = self._resolve_impl(token_ids, vocab_size=vocab_size)
+        if impl == "exact":
+            return _rosa_next_token_ids_exact_eager(token_ids)
         return rosa_next_token_ids_batch(token_ids, impl=impl)
 
     def _resolve_impl(self, token_ids: torch.Tensor, *, vocab_size: int) -> str:

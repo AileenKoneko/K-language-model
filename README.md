@@ -292,4 +292,15 @@ Editable install scripts from [pyproject.toml](pyproject.toml):
 
 ## License
 
-[LICENSE](LICENSE)
+This repository's original code is licensed under [MIT](LICENSE).
+
+Some ROSA-related files include implementation material derived from the RWKV-v8 ROSA formulation and pseudocode, and are distributed with Apache-2.0 attribution:
+
+- [k_language_model/rosa.py](k_language_model/rosa.py)
+- [k_language_model/rosa_backends.py](k_language_model/rosa_backends.py)
+- [k_language_model/rosa_ext.cpp](k_language_model/rosa_ext.cpp)
+
+See:
+
+- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+- [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt)

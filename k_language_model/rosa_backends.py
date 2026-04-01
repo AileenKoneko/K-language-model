@@ -1,3 +1,6 @@
+# This file wires ROSA backends around the ROSA implementation in `rosa.py`.
+# See THIRD_PARTY_NOTICES.md and LICENSES/Apache-2.0.txt for attribution and terms.
+
 from __future__ import annotations
 
 import warnings

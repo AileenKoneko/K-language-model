@@ -120,6 +120,37 @@ class ModelV2Tests(unittest.TestCase):
         self.assertNotIn("head_to_emb.weight", adapted)
         self.assertNotIn("eta_logit", adapted)
 
+    def test_decay_buffers_are_not_persisted_but_legacy_buffer_keys_are_dropped(self) -> None:
+        model = KStackModel(
+            vocab_size=16,
+            window=8,
+            d=4,
+            emb_dim=4,
+            rank=2,
+            n_k2=2,
+            emb_dropout=0.0,
+            mlp_dropout=0.0,
+            residual_dropout=0.0,
+            share_k_base=True,
+            k_base_kernel_size=4,
+            rosa_impl="off",
+        )
+
+        state = model.state_dict()
+        self.assertNotIn("k_stack.layers.1.causal_mask", state)
+        self.assertNotIn("k_stack.layers.1.decay_diff", state)
+        self.assertEqual(tuple(model.k_stack.layers[1].causal_mask.shape), (8, 8))
+        self.assertEqual(tuple(model.k_stack.layers[1].decay_diff.shape), (8, 8))
+
+        adapted = model.prepare_state_dict_for_load(
+            {
+                "k_stack.layers.1.causal_mask": torch.ones(8, 8),
+                "k_stack.layers.1.decay_diff": torch.zeros(8, 8),
+            }
+        )
+        self.assertNotIn("k_stack.layers.1.causal_mask", adapted)
+        self.assertNotIn("k_stack.layers.1.decay_diff", adapted)
+
     def test_train_app_build_model_selects_v2(self) -> None:
         args = build_parser().parse_args(
             [

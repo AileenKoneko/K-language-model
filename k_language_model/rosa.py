@@ -1,3 +1,6 @@
+# Portions of this file are derived from RWKV-v8 ROSA pseudocode/materials.
+# See THIRD_PARTY_NOTICES.md and LICENSES/Apache-2.0.txt for attribution and terms.
+
 from __future__ import annotations
 
 import importlib.util

@@ -290,6 +290,14 @@ Editable install scripts from [pyproject.toml](pyproject.toml):
 - `k-lm-sequence-stats`
 - `k-lm-ui`
 
+## Roadmap
+
+Current near-term work:
+
+- Implement fused ROSA
+- Add a prefix-scan decay path
+- Test V2 scaling on WikiText-103
+
 ## License
 
 This repository's original code is licensed under [MIT](LICENSE).

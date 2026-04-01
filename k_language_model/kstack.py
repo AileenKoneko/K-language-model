@@ -67,8 +67,12 @@ class K2Layer(nn.Module):
         self.decay_logit = nn.Parameter(torch.log(p / (1.0 - p)))
 
         pos = torch.arange(self.window, dtype=torch.float32)
-        self.register_buffer("causal_mask", torch.tril(torch.ones(self.window, self.window)))
-        self.register_buffer("decay_diff", (pos.unsqueeze(1) - pos.unsqueeze(0)).clamp(min=0).contiguous())
+        self.register_buffer("causal_mask", torch.tril(torch.ones(self.window, self.window)), persistent=False)
+        self.register_buffer(
+            "decay_diff",
+            (pos.unsqueeze(1) - pos.unsqueeze(0)).clamp(min=0).contiguous(),
+            persistent=False,
+        )
         self._causal_mask_smoke_checked = False
 
         self.k_base_gate_logit = nn.Parameter(torch.tensor(0.0))
@@ -337,6 +341,9 @@ class KStackModel(nn.Module):
 
         adapted = dict(state)
         adapted.pop("eta_logit", None)
+        for key in list(adapted.keys()):
+            if key.endswith(".causal_mask") or key.endswith(".decay_diff"):
+                adapted.pop(key, None)
         layer_indices = self._k2_layer_indices()
         shared_key = "k_stack.shared_k_base_kernel"
 

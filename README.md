@@ -14,6 +14,17 @@ Historical branch material:
 - [README_v1.md](README_v1.md)
 - [RESULTS_V1.md](RESULTS_V1.md)
 
+## Results
+
+Current V2 snapshots:
+
+| Dataset | Tokenizer | Checkpoint | Step | Params | Config | Val CE | Val PPL | Throughput |
+|---|---|---|---:|---:|---|---:|---:|---:|
+| Tiny Shakespeare | char | `models/tiny-shakespeare/v2/shakespeare_char_v2.pt` | 5000 | `178,692` | `window=2048, d_model=64, n_k2=6, rank=4, share_k_base, k_base_kernel_size=8` | **1.3975** | **4.05** | `736,662 tok/s` |
+| Tiny Shakespeare | byte | `models/tiny-shakespeare/v2/byte_shakespeare_v2_new.pt` | 5000 | `184,396` | `window=2048, d_model=58, emb_dim=64, n_k2=6, rank=4, share_k_base, k_base_kernel_size=8` | **1.4219** | **4.14** | `736,662 tok/s` |
+
+This is the current small-model reference point for the V2 branch, not a final benchmark table.
+
 ## What changed in V2
 
 ### 1. The model is V2-only now
@@ -85,7 +96,7 @@ Inside `K2Layer`:
 - projection + residual
 - MLP sub-block
 
-## ROSA (Rapid Online Suffix Automation)
+## ROSA (Rapid Online Suffix Automaton)
 
 ROSA lives in [rosa_backends.py](k_language_model/rosa_backends.py) and [rosa.py](k_language_model/rosa.py). Available backends are `off`, `exact`, `gpu_approx`, and `auto`.
 

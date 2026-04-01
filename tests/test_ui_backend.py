@@ -23,7 +23,7 @@ def test_build_train_command_from_form_emits_expected_flags() -> None:
             "job_name": "byte-sweep",
             "dataset": "shakespeare",
             "tokenizer": "byte",
-            "ckpt": "models/byte_shakespeare_v2.pt",
+            "ckpt": "models/char_shakespeare_v2.pt",
             "steps": "500",
             "batch_size": "16",
             "window": "256",

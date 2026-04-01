@@ -200,7 +200,7 @@ TRAIN_FORM_SECTIONS: tuple[UiSection, ...] = (
                 "train",
                 "ckpt",
                 "Checkpoint Path",
-                placeholder="models/byte_shakespeare_v2.pt",
+                placeholder="models/char_shakespeare_v2.pt",
                 help_text="Optional output checkpoint path.",
                 datalist_id="checkpoint-list",
             ),

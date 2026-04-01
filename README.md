@@ -16,12 +16,18 @@ Historical branch material:
 
 ## Results
 
-Current V2 snapshots:
+Current V2 snapshots
+All runs performed on a single A100 GPU with the same training loop and hyperparameters, except for the `rosa_impl` using exact backend and no C++ formulation, and tokenizer variations. Final eval score reported from M1 Pro run with `deterministic=true, strict_repro=true`.
+Shared flags: `window=2048, d_model=64, n_k2=6, rank=4, share_k_base, k_base_kernel_size=8, decay_impl=mask, batch_size=32, eval_interval=250, lr=1e-2, gamma_min=0.05, alpha_cap=1.0, steps=5000, dataset=shakespeare, seed=42`
+For byte tokenizer, additionally: `emb_dim=64`
 
-| Dataset | Tokenizer | Checkpoint | Step | Params | Config | Val CE | Val PPL | Throughput |
-|---|---|---|---:|---:|---|---:|---:|---:|
-| Tiny Shakespeare | char | `models/tiny-shakespeare/v2/shakespeare_char_v2.pt` | 5000 | `178,692` | `window=2048, d_model=64, n_k2=6, rank=4, share_k_base, k_base_kernel_size=8` | **1.3975** | **4.05** | `736,662 tok/s` |
-| Tiny Shakespeare | byte | `models/tiny-shakespeare/v2/byte_shakespeare_v2_new.pt` | 5000 | `184,396` | `window=2048, d_model=58, emb_dim=64, n_k2=6, rank=4, share_k_base, k_base_kernel_size=8` | **1.4219** | **4.14** | `736,662 tok/s` |
+| Dataset          | Tokenizer | ROSA     | Checkpoint                                                   | Step |    Params |     Val CE |  Val PPL |        Throughput |
+|------------------|-----------|----------|--------------------------------------------------------------|-----:|----------:|-----------:|---------:|------------------:|
+| Tiny Shakespeare | char      | ON       | `models/tiny-shakespeare/v2/char_shakespeare_v2.pt`          | 5000 | `178,692` | **1.4028** | **4.07** |   `328,828 tok/s` |
+| Tiny Shakespeare | char      | OFF      | `models/tiny-shakespeare/v2/char_shakespeare_v2_rosa_off.pt` | 5000 | `174,768` | **1.4671** | **4.34** | `2,758,557 tok/s` |
+| Tiny Shakespeare | char      | ON (C++) | `models/tiny-shakespeare/v2/char_shakespeare_v2_rosa_cpp.pt` | 5000 | `178,692` | **1.3954** | **4.04** |   `749,646 tok/s` |
+| Tiny Shakespeare | byte      | ON       | `models/tiny-shakespeare/v2/byte_shakespeare_v2.pt`          | 5000 | `203,140` | **1.4072** | **4.08** |   `330,524 tok/s` |
+| Tiny Shakespeare | byte      | OFF      | `models/tiny-shakespeare/v2/byte_shakespeare_v2_rosa_off.pt` | 5000 | `186,692` | **1.4787** | **4.39** | `2,706,928 tok/s` |
 
 This is the current small-model reference point for the V2 branch, not a final benchmark table.
 

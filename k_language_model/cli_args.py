@@ -99,7 +99,7 @@ def add_model_args(parser: argparse.ArgumentParser, *, include_dropouts: bool, a
     )
     parser.set_defaults(share_k_base=False)
     parser.add_argument("--n-k2", type=int, default=4)
-    parser.add_argument("--head-mode", type=str, choices=["linear", "gelu", "adaptive"], default="linear")
+    parser.add_argument("--head-mode", type=str, choices=["linear", "gelu", "trajectory", "adaptive"], default="linear")
     parser.add_argument("--head-mult", type=int, default=6)
     parser.add_argument("--head-dropout", type=float, default=0.10)
     parser.add_argument(
@@ -140,9 +140,9 @@ def add_dynamics_args(parser: argparse.ArgumentParser, *, decay_help: str) -> No
         default="all",
         help="ROSA-enabled K2 layers: all, final, none, or comma-separated 1-based ids (for example: 4,5,6).",
     )
-    parser.add_argument("--gamma-min", type=float, default=0.85, help="Lower bound for per-rank gamma decay values.")
+    parser.add_argument("--gamma-min", type=float, default=0.05, help="Lower bound for per-rank gamma decay values.")
     parser.add_argument("--gamma-max", type=float, default=1.0, help="Upper bound for per-rank gamma decay values.")
-    parser.add_argument("--alpha-cap", type=float, default=0.8)
+    parser.add_argument("--alpha-cap", type=float, default=1.0)
 
 
 def add_repro_runtime_args(
@@ -188,6 +188,106 @@ def add_repro_runtime_args(
             choices=["default", "reduce-overhead", "max-autotune"],
             default="default",
         )
+
+
+def add_experimental_objective_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--future-summary-horizons",
+        type=str,
+        default=None,
+        help="Comma-separated future-summary horizons, for example 8,32,128. Overrides --future-summary-horizon when provided.",
+    )
+    parser.add_argument(
+        "--future-summary-horizon",
+        type=int,
+        default=0,
+        help="Compatibility single-horizon form of future-summary loss. 0 disables it unless --future-summary-horizons is set.",
+    )
+    parser.add_argument(
+        "--future-summary-lambda",
+        type=float,
+        default=0.05,
+        help="Weight for cosine loss that pushes h_t toward a pooled summary of the next H hidden states.",
+    )
+    parser.add_argument(
+        "--future-summary-lambda-min",
+        type=float,
+        default=0.0,
+        help="Minimum future-summary weight after CE-driven decay. Ignored unless --future-summary-ce-target is set.",
+    )
+    parser.add_argument(
+        "--future-summary-ce-target",
+        type=float,
+        default=None,
+        help="If set, decay the future-summary lambda as train_ce_ema approaches this CE target.",
+    )
+    parser.add_argument(
+        "--future-summary-ce-anchor",
+        type=float,
+        default=None,
+        help="Optional CE anchor for future-summary lambda decay. If omitted, the EMA at future-loss activation is used.",
+    )
+    parser.add_argument(
+        "--future-summary-start-step",
+        type=int,
+        default=None,
+        help="Step at which future-summary loss becomes active. Defaults to --warmup-steps when enabled.",
+    )
+    parser.add_argument(
+        "--future-summary-eval-batches",
+        type=int,
+        default=16,
+        help="Number of deterministic validation batches used for future-summary eval. 0 disables future-summary eval logging.",
+    )
+    parser.add_argument(
+        "--rollout-horizon",
+        type=int,
+        default=0,
+        help="Experimental free-running rollout horizon H. 0 disables rollout and semantic auxiliary losses.",
+    )
+    parser.add_argument(
+        "--rollout-lambda",
+        type=float,
+        default=0.2,
+        help="Weight for rollout CE measured on self-fed continuations.",
+    )
+    parser.add_argument(
+        "--rollout-start-step",
+        type=int,
+        default=None,
+        help="Step at which rollout CE becomes active. Defaults to --warmup-steps when rollout is enabled.",
+    )
+    parser.add_argument(
+        "--rollout-mode",
+        type=str,
+        choices=["argmax", "sample"],
+        default="argmax",
+        help="Token selection mode used inside rollout training.",
+    )
+    parser.add_argument(
+        "--semantic-lambda",
+        type=float,
+        default=0.05,
+        help="Weight for pooled-hidden cosine loss between rollout and gold continuations.",
+    )
+    parser.add_argument(
+        "--semantic-start-step",
+        type=int,
+        default=None,
+        help="Step at which semantic loss becomes active. Defaults to the final training quarter when enabled.",
+    )
+    parser.add_argument(
+        "--rollout-eval-batches",
+        type=int,
+        default=16,
+        help="Number of deterministic validation batches used for rollout-aware eval. 0 disables rollout eval logging.",
+    )
+    parser.add_argument(
+        "--rollout-useful-ce-tol",
+        type=float,
+        default=0.05,
+        help="CE guardrail for best_useful checkpointing: require val_ce <= best_val_ce + tol.",
+    )
 
 
 def add_sampling_args(

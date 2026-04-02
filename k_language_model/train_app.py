@@ -4,12 +4,19 @@ from pathlib import Path
 import torch
 
 from .checkpoint import load_model_checkpoint
-from .cli_args import add_dataset_args, add_dynamics_args, add_model_args, add_repro_runtime_args, add_sampling_args
+from .cli_args import (
+    add_dataset_args,
+    add_dynamics_args,
+    add_experimental_objective_args,
+    add_model_args,
+    add_repro_runtime_args,
+    add_sampling_args,
+)
 from .configs import DatasetConfig
 from .data import load_dataset_bundle
 from .generation import sample_text
 from .model import resolve_adaptive_cutoffs
-from .model_factory import build_model, model_config_from_args, parse_adaptive_cutoffs
+from .model_factory import build_model, model_config_from_args, parse_adaptive_cutoffs, parse_int_list
 from .runtime import (
     DEVICE,
     LOG,
@@ -104,6 +111,7 @@ def build_parser(description: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="Enable verbose diagnostic logging (grad stats, layer stats, update/weight ratios) at eval intervals.",
     )
+    add_experimental_objective_args(p)
     add_repro_runtime_args(
         p,
         include_compile=True,
@@ -209,6 +217,10 @@ def main() -> None:
             str(remap_by_frequency).lower(),
         )
 
+    future_horizons = parse_int_list(args.future_summary_horizons)
+    if not future_horizons and int(args.future_summary_horizon) > 0:
+        future_horizons = (int(args.future_summary_horizon),)
+
     cfg = TrainConfig(
         window=args.window,
         d_model=args.d_model,
@@ -235,7 +247,37 @@ def main() -> None:
         eval_interval=args.eval_interval,
         diagnostics=args.diagnostics,
         report_bpc=(args.dataset in {"wikitext2", "wikitext2_raw"} and tokenizer.is_character_level),
+        future_summary_horizons=future_horizons,
+        future_summary_lambda=max(float(args.future_summary_lambda), 0.0),
+        future_summary_lambda_min=max(float(args.future_summary_lambda_min), 0.0),
+        future_summary_ce_target=(
+            float(args.future_summary_ce_target) if args.future_summary_ce_target is not None else None
+        ),
+        future_summary_ce_anchor=(
+            float(args.future_summary_ce_anchor) if args.future_summary_ce_anchor is not None else None
+        ),
+        future_summary_start_step=0,
+        future_summary_eval_batches=max(int(args.future_summary_eval_batches), 0),
+        rollout_horizon=max(int(args.rollout_horizon), 0),
+        rollout_lambda=max(float(args.rollout_lambda), 0.0),
+        rollout_start_step=0,
+        rollout_mode=str(args.rollout_mode).strip().lower(),
+        semantic_lambda=max(float(args.semantic_lambda), 0.0),
+        semantic_start_step=0,
+        rollout_eval_batches=max(int(args.rollout_eval_batches), 0),
+        rollout_useful_ce_tol=max(float(args.rollout_useful_ce_tol), 0.0),
     )
+    if cfg.future_summary_horizons and cfg.future_summary_lambda > 0.0:
+        cfg.future_summary_start_step = (
+            args.future_summary_start_step if args.future_summary_start_step is not None else args.warmup_steps
+        )
+    if cfg.rollout_horizon > 0 and cfg.rollout_lambda > 0.0:
+        cfg.rollout_start_step = args.rollout_start_step if args.rollout_start_step is not None else args.warmup_steps
+    if cfg.rollout_horizon > 0 and cfg.rollout_lambda > 0.0 and cfg.semantic_lambda > 0.0:
+        default_semantic_start = max(cfg.rollout_start_step, int(0.75 * max(args.steps, 1)))
+        cfg.semantic_start_step = (
+            args.semantic_start_step if args.semantic_start_step is not None else default_semantic_start
+        )
 
     LOG.info("Model family | version=v2")
     model = build_model(

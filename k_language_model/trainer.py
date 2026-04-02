@@ -7,9 +7,10 @@ from typing import Dict, List
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from .checkpoint import load_checkpoint, save_checkpoint
-from .data import get_batch
+from .checkpoint import load_checkpoint, load_checkpoint_metadata, save_checkpoint
+from .data import get_batch, get_rollout_batch
 from .model import KStackModel
 from .runtime import AMP_DTYPE, DEVICE, LOG, USE_AMP, _autocast_context, _unwrap_model
 
@@ -88,6 +89,437 @@ class TrainConfig:
     grad_topk: int = 3
     diagnostics: bool = False
     report_bpc: bool = False
+    future_summary_horizons: tuple[int, ...] = ()
+    future_summary_lambda: float = 0.05
+    future_summary_lambda_min: float = 0.0
+    future_summary_ce_target: float | None = None
+    future_summary_ce_anchor: float | None = None
+    future_summary_start_step: int = 0
+    future_summary_eval_batches: int = 16
+    rollout_horizon: int = 0
+    rollout_lambda: float = 0.2
+    rollout_start_step: int = 0
+    rollout_mode: str = "argmax"
+    semantic_lambda: float = 0.05
+    semantic_start_step: int = 0
+    rollout_eval_batches: int = 16
+    rollout_useful_ce_tol: float = 0.05
+
+
+@dataclass
+class StepLossStats:
+    total: float
+    ce: float
+    future: float
+    future_lambda: float
+    rollout: float
+    semantic: float
+    phase: str
+
+
+@dataclass
+class CheckpointTargets:
+    best_ppl: Path
+    best_rollout: Path
+    best_useful: Path
+
+
+def _checkpoint_variant_path(base: Path, variant: str) -> Path:
+    suffix = "".join(base.suffixes)
+    stem = base.name[: -len(suffix)] if suffix else base.name
+    if not stem:
+        stem = base.name
+    filename = f"{stem}.{variant}{suffix}" if suffix else f"{stem}.{variant}"
+    return base.with_name(filename)
+
+
+def _resolve_checkpoint_targets(ckpt_path: Path | None) -> CheckpointTargets | None:
+    if ckpt_path is None:
+        return None
+    return CheckpointTargets(
+        best_ppl=ckpt_path,
+        best_rollout=_checkpoint_variant_path(ckpt_path, "best_rollout"),
+        best_useful=_checkpoint_variant_path(ckpt_path, "best_useful"),
+    )
+
+
+def _metric_from_checkpoint(path: Path, key: str) -> float:
+    meta = load_checkpoint_metadata(path)
+    value = meta.get(key)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def _resolve_loss_phase(cfg: TrainConfig, step: int) -> tuple[bool, bool, bool, str]:
+    future_active = (
+        bool(cfg.future_summary_horizons)
+        and cfg.future_summary_lambda > 0.0
+        and step >= max(int(cfg.future_summary_start_step), 0)
+    )
+    rollout_active = (
+        cfg.rollout_horizon > 0
+        and cfg.rollout_lambda > 0.0
+        and step >= max(int(cfg.rollout_start_step), 0)
+    )
+    semantic_active = (
+        rollout_active
+        and cfg.semantic_lambda > 0.0
+        and step >= max(int(cfg.semantic_start_step), 0)
+    )
+    phase_parts: List[str] = []
+    if rollout_active:
+        phase_parts.append("rollout")
+    if semantic_active:
+        phase_parts.append("semantic")
+    if future_active:
+        phase_parts.append("future")
+    phase = "+".join(phase_parts) if phase_parts else "ce"
+    return rollout_active, semantic_active, future_active, phase
+
+
+def _resolve_future_lambda(
+    cfg: TrainConfig,
+    ce_reference: float | None,
+    anchor: float | None,
+) -> tuple[float, float | None]:
+    lambda_max = max(float(cfg.future_summary_lambda), 0.0)
+    if not cfg.future_summary_horizons or lambda_max <= 0.0:
+        return 0.0, anchor
+
+    lambda_min = min(max(float(cfg.future_summary_lambda_min), 0.0), lambda_max)
+    ce_target = cfg.future_summary_ce_target
+    if ce_target is None or not math.isfinite(float(ce_target)):
+        return lambda_max, anchor
+    ce_target = float(ce_target)
+
+    resolved_anchor = anchor
+    if resolved_anchor is None and cfg.future_summary_ce_anchor is not None and math.isfinite(float(cfg.future_summary_ce_anchor)):
+        resolved_anchor = float(cfg.future_summary_ce_anchor)
+
+    ce_value = None
+    if ce_reference is not None:
+        try:
+            ce_candidate = float(ce_reference)
+        except (TypeError, ValueError):
+            ce_candidate = float("nan")
+        if math.isfinite(ce_candidate):
+            ce_value = ce_candidate
+
+    if resolved_anchor is None and ce_value is not None:
+        resolved_anchor = max(ce_value, ce_target + 1e-6)
+
+    if resolved_anchor is None:
+        return lambda_max, None
+
+    resolved_anchor = max(float(resolved_anchor), ce_target + 1e-6)
+    if ce_value is None:
+        return lambda_max, resolved_anchor
+
+    progress = (ce_value - ce_target) / max(resolved_anchor - ce_target, 1e-6)
+    progress = min(max(progress, 0.0), 1.0)
+    lambda_eff = lambda_min + (lambda_max - lambda_min) * progress
+    return lambda_eff, resolved_anchor
+
+
+def _compute_future_summary_loss(
+    core_model: KStackModel,
+    hidden: torch.Tensor,
+    horizons: tuple[int, ...],
+) -> torch.Tensor:
+    if not horizons or hidden.ndim != 3 or hidden.size(1) <= 1:
+        return torch.zeros((), device=hidden.device, dtype=torch.float32)
+
+    predictors = core_model.predict_future_summaries(hidden)
+    if not predictors:
+        return torch.zeros((), device=hidden.device, dtype=torch.float32)
+
+    hidden_float = hidden.float()
+    future = hidden_float.detach()[:, 1:, :]
+    if future.size(1) <= 0:
+        return hidden_float.new_zeros(())
+
+    zero = torch.zeros(future.size(0), 1, future.size(2), device=future.device, dtype=future.dtype)
+    cumsum = torch.cat((zero, future.cumsum(dim=1)), dim=1)
+    losses = []
+    for horizon in horizons:
+        if horizon <= 0 or hidden.size(1) <= horizon or horizon not in predictors:
+            continue
+        target_sum = cumsum[:, horizon:, :] - cumsum[:, :-horizon, :]
+        target_avg = target_sum / float(horizon)
+        current = hidden_float.detach()[:, : hidden.size(1) - horizon, :]
+        target_direction = target_avg - current
+        pred_direction = predictors[horizon][:, : hidden.size(1) - horizon, :].float()
+
+        pred_direction = F.normalize(pred_direction, dim=-1, eps=1e-8)
+        target_direction = F.normalize(target_direction, dim=-1, eps=1e-8)
+        losses.append(1.0 - (pred_direction * target_direction).sum(dim=-1).mean())
+
+    if not losses:
+        return hidden_float.new_zeros(())
+    return torch.stack(losses, dim=0).mean()
+
+
+def _select_rollout_tokens(scores: torch.Tensor, mode: str) -> torch.Tensor:
+    mode = str(mode).strip().lower()
+    detached = scores.detach()
+    if mode == "argmax":
+        return detached.argmax(dim=-1, keepdim=True)
+    if mode == "sample":
+        probs = F.softmax(detached, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+    raise ValueError(f"Unsupported rollout_mode: {mode}")
+
+
+@torch.no_grad()
+def _teacher_rollout_pooled_hidden(core_model: KStackModel, rollout_prefix: torch.Tensor, true_chunk: torch.Tensor) -> torch.Tensor:
+    was_training = core_model.training
+    core_model.eval()
+    context = rollout_prefix
+    pooled_steps = []
+    try:
+        for idx in range(true_chunk.size(1)):
+            context_window = context[:, -core_model.window:]
+            hidden = core_model.hidden_states(context_window)
+            pooled_steps.append(hidden[:, -1, :])
+            context = torch.cat([context, true_chunk[:, idx: idx + 1]], dim=1)
+    finally:
+        core_model.train(was_training)
+    return torch.stack(pooled_steps, dim=1).mean(dim=1)
+
+
+def _compute_rollout_losses(
+    core_model: KStackModel,
+    rollout_prefix: torch.Tensor,
+    true_chunk: torch.Tensor,
+    *,
+    rollout_mode: str,
+    include_semantic: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if true_chunk.ndim != 2 or true_chunk.size(1) <= 0:
+        zero = torch.zeros((), device=rollout_prefix.device, dtype=torch.float32)
+        return zero, zero
+
+    rollout_losses = []
+    generated_hidden = []
+    context = rollout_prefix
+    for idx in range(true_chunk.size(1)):
+        context_window = context[:, -core_model.window:]
+        hidden = core_model.hidden_states(context_window)
+        scores = core_model.scores_from_hidden(hidden)[:, -1, :]
+        rollout_losses.append(F.cross_entropy(scores.float(), true_chunk[:, idx], reduction="mean"))
+        generated_hidden.append(hidden[:, -1, :])
+        next_token = _select_rollout_tokens(scores, rollout_mode)
+        context = torch.cat([context, next_token], dim=1)
+
+    rollout_ce = torch.stack(rollout_losses, dim=0).mean()
+    semantic_loss = rollout_ce.new_zeros(())
+    if include_semantic:
+        target_pool = _teacher_rollout_pooled_hidden(core_model, rollout_prefix, true_chunk).detach()
+        gen_pool = torch.stack(generated_hidden, dim=1).mean(dim=1)
+        gen_pool = F.normalize(gen_pool.float(), dim=-1, eps=1e-8)
+        target_pool = F.normalize(target_pool.float(), dim=-1, eps=1e-8)
+        semantic_loss = (1.0 - (gen_pool * target_pool).sum(dim=-1)).mean()
+    return rollout_ce, semantic_loss
+
+
+def _compute_train_loss(
+    model: nn.Module,
+    train_data: torch.Tensor,
+    cfg: TrainConfig,
+    step: int,
+    *,
+    future_lambda: float,
+) -> tuple[torch.Tensor, StepLossStats]:
+    rollout_active, semantic_active, future_active, phase = _resolve_loss_phase(cfg, step)
+    if not rollout_active and not future_active:
+        x, y = get_batch(train_data, cfg.window, cfg.batch_size, DEVICE)
+        ce_loss = model(x, targets=y)
+        ce_value = float(ce_loss.detach().item())
+        return ce_loss, StepLossStats(
+            total=ce_value,
+            ce=ce_value,
+            future=float("nan"),
+            future_lambda=float("nan"),
+            rollout=float("nan"),
+            semantic=float("nan"),
+            phase=phase,
+        )
+
+    core_model = _unwrap_model(model)
+    if rollout_active:
+        x, y, rollout_prefix, true_chunk = get_rollout_batch(
+            train_data,
+            cfg.window,
+            cfg.rollout_horizon,
+            cfg.batch_size,
+            DEVICE,
+        )
+    else:
+        x, y = get_batch(train_data, cfg.window, cfg.batch_size, DEVICE)
+        rollout_prefix = x
+        true_chunk = x[:, :0]
+
+    hidden = core_model.hidden_states(x)
+    ce_loss = core_model.loss_from_hidden(hidden, y)
+    future_summary_loss = (
+        _compute_future_summary_loss(core_model, hidden, cfg.future_summary_horizons)
+        if future_active
+        else ce_loss.new_zeros(())
+    )
+
+    rollout_ce, semantic_loss = _compute_rollout_losses(
+        core_model,
+        rollout_prefix,
+        true_chunk,
+        rollout_mode=cfg.rollout_mode,
+        include_semantic=semantic_active,
+    ) if rollout_active else (ce_loss.new_zeros(()), ce_loss.new_zeros(()))
+
+    total_loss = ce_loss + future_lambda * future_summary_loss
+    if rollout_active:
+        total_loss = total_loss + cfg.rollout_lambda * rollout_ce
+    if semantic_active:
+        total_loss = total_loss + cfg.semantic_lambda * semantic_loss
+    return total_loss, StepLossStats(
+        total=float(total_loss.detach().item()),
+        ce=float(ce_loss.detach().item()),
+        future=float(future_summary_loss.detach().item()) if future_active else float("nan"),
+        future_lambda=float(future_lambda) if future_active else float("nan"),
+        rollout=float(rollout_ce.detach().item()) if rollout_active else float("nan"),
+        semantic=float(semantic_loss.detach().item()) if semantic_active else float("nan"),
+        phase=phase,
+    )
+
+
+@torch.no_grad()
+def eval_rollout_deterministic(
+    model: nn.Module,
+    data: torch.Tensor,
+    window: int,
+    batch_size: int,
+    horizon: int,
+    max_batches: int,
+) -> tuple[float, float, int]:
+    if horizon <= 0 or max_batches <= 0:
+        return float("nan"), float("nan"), 0
+
+    model.eval()
+    core_model = _unwrap_model(model)
+
+    device_obj = torch.device(DEVICE)
+    if data.device != device_obj:
+        data = data.to(device_obj, non_blocking=True)
+    if not data.is_contiguous():
+        data = data.contiguous()
+
+    total_len = window + horizon + 1
+    available = (len(data) - 1) // total_len
+    if available <= 0:
+        return float("nan"), float("nan"), 0
+
+    target_examples = min(int(available), int(batch_size) * int(max_batches))
+    if target_examples <= 0:
+        return float("nan"), float("nan"), 0
+
+    if target_examples == available:
+        example_ids = torch.arange(available, device=data.device, dtype=torch.long)
+    else:
+        example_ids = torch.linspace(
+            0,
+            available - 1,
+            steps=target_examples,
+            device=data.device,
+            dtype=torch.float32,
+        ).round().to(dtype=torch.long)
+    starts = example_ids * total_len
+    offsets = torch.arange(total_len, device=data.device, dtype=torch.long)
+    seq = data.index_select(0, (starts.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)).view(target_examples, total_len)
+
+    total_rollout = 0.0
+    total_semantic = 0.0
+    total_count = 0
+    for start in range(0, target_examples, batch_size):
+        batch_seq = seq[start: start + batch_size]
+        rollout_prefix = batch_seq[:, 1: window + 1]
+        true_chunk = batch_seq[:, window + 1:]
+        with _autocast_context():
+            rollout_ce, semantic_loss = _compute_rollout_losses(
+                core_model,
+                rollout_prefix,
+                true_chunk,
+                rollout_mode="argmax",
+                include_semantic=True,
+            )
+        count = int(batch_seq.size(0))
+        total_rollout += float(rollout_ce.item()) * count
+        total_semantic += float(semantic_loss.item()) * count
+        total_count += count
+
+    if total_count <= 0:
+        return float("nan"), float("nan"), 0
+    return total_rollout / total_count, total_semantic / total_count, total_count
+
+
+@torch.no_grad()
+def eval_future_summary_deterministic(
+    model: nn.Module,
+    data: torch.Tensor,
+    window: int,
+    batch_size: int,
+    horizons: tuple[int, ...],
+    max_batches: int,
+) -> tuple[float, int]:
+    if not horizons or max_batches <= 0 or window <= min(horizons):
+        return float("nan"), 0
+
+    model.eval()
+    core_model = _unwrap_model(model)
+
+    device_obj = torch.device(DEVICE)
+    if data.device != device_obj:
+        data = data.to(device_obj, non_blocking=True)
+    if not data.is_contiguous():
+        data = data.contiguous()
+
+    n_tokens = len(data) - 1
+    usable_tokens = (n_tokens // window) * window
+    if usable_tokens <= 0:
+        return float("nan"), 0
+
+    x_all = data[:usable_tokens].view(-1, window)
+    total_examples = int(x_all.size(0))
+    target_examples = min(total_examples, int(batch_size) * int(max_batches))
+    if target_examples <= 0:
+        return float("nan"), 0
+
+    if target_examples == total_examples:
+        example_ids = torch.arange(total_examples, device=x_all.device, dtype=torch.long)
+    else:
+        example_ids = torch.linspace(
+            0,
+            total_examples - 1,
+            steps=target_examples,
+            device=x_all.device,
+            dtype=torch.float32,
+        ).round().to(dtype=torch.long)
+    x_eval = x_all.index_select(0, example_ids)
+
+    total_future = 0.0
+    total_count = 0
+    for start in range(0, x_eval.size(0), batch_size):
+        x = x_eval[start: start + batch_size]
+        with _autocast_context():
+            hidden = core_model.hidden_states(x)
+            future_loss = _compute_future_summary_loss(core_model, hidden, horizons)
+        count = int(x.size(0))
+        total_future += float(future_loss.item()) * count
+        total_count += count
+
+    if total_count <= 0:
+        return float("nan"), 0
+    return total_future / total_count, total_count
 
 
 def _collect_grad_stats(model: nn.Module, topk: int = 3) -> Dict[str, object]:
@@ -334,6 +766,10 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
     train_data = train_data.to(DEVICE, non_blocking=True)
     val_data = val_data.to(DEVICE, non_blocking=True)
 
+    if cfg.rollout_mode not in {"argmax", "sample"}:
+        raise ValueError(f"Unsupported rollout_mode: {cfg.rollout_mode}")
+    if cfg.rollout_horizon < 0:
+        raise ValueError(f"rollout_horizon must be >= 0, got {cfg.rollout_horizon}")
     if cfg.optimizer_mode == "grouped":
         param_groups = _build_optimizer_param_groups(model, cfg)
     elif cfg.optimizer_mode == "simple":
@@ -368,6 +804,12 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
     best_ppl = float("inf")
     if ckpt_path and ckpt_path.exists():
         start_step, best_ppl = load_checkpoint(ckpt_path, model, optimizer)
+    ckpt_targets = _resolve_checkpoint_targets(ckpt_path)
+    best_rollout_ce = float("inf")
+    best_useful_rollout_ce = float("inf")
+    if ckpt_targets is not None:
+        best_rollout_ce = _metric_from_checkpoint(ckpt_targets.best_rollout, "val_rollout_ce")
+        best_useful_rollout_ce = _metric_from_checkpoint(ckpt_targets.best_useful, "val_rollout_ce")
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -396,28 +838,80 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
         n_params = sum(p.numel() for p in g["params"])
         group_parts.append(f"{g.get('name', 'group')}[n={n_params},lr={g['lr']:.2e},wd={g['weight_decay']:.2e}]")
     LOG.info("Optimizer groups | %s", " | ".join(group_parts))
+    if cfg.rollout_horizon > 0 and cfg.rollout_lambda > 0.0:
+        LOG.info(
+            "Aux objective | horizon=%d | rollout_lambda=%.3f | rollout_start=%d | rollout_mode=%s | semantic_lambda=%.3f | semantic_start=%d",
+            cfg.rollout_horizon,
+            cfg.rollout_lambda,
+            cfg.rollout_start_step,
+            cfg.rollout_mode,
+            cfg.semantic_lambda,
+            cfg.semantic_start_step,
+        )
+    future_horizons_str = ",".join(str(h) for h in cfg.future_summary_horizons) if cfg.future_summary_horizons else ""
+    if cfg.future_summary_horizons and cfg.future_summary_lambda > 0.0:
+        LOG.info(
+            "Future summary | horizons=%s | future_lambda_max=%.3f | future_lambda_min=%.3f | future_start=%d",
+            future_horizons_str,
+            cfg.future_summary_lambda,
+            cfg.future_summary_lambda_min,
+            cfg.future_summary_start_step,
+        )
+        if cfg.future_summary_ce_target is not None:
+            anchor_str = "auto" if cfg.future_summary_ce_anchor is None else f"{cfg.future_summary_ce_anchor:.4f}"
+            LOG.info(
+                "Future lambda schedule | ce_target=%.4f | ce_anchor=%s",
+                cfg.future_summary_ce_target,
+                anchor_str,
+            )
+    if cfg.rollout_horizon > 0 and cfg.rollout_eval_batches > 0:
+        LOG.info(
+            "Rollout eval | horizon=%d | batches=%d | mode=argmax",
+            cfg.rollout_horizon,
+            cfg.rollout_eval_batches,
+        )
+    if cfg.future_summary_horizons and cfg.future_summary_eval_batches > 0:
+        LOG.info(
+            "Future eval | horizons=%s | batches=%d",
+            future_horizons_str,
+            cfg.future_summary_eval_batches,
+        )
 
     step_times: List[float] = []
     compile_warmup_pending = model is not _unwrap_model(model)
     if compile_warmup_pending:
         LOG.info("Compile warmup | first train step will include graph capture and is excluded from speed metrics.")
     train_loss_ema = None
+    future_lambda_anchor = cfg.future_summary_ce_anchor
     best_ce = float("inf")
+    best_val_ce = float("inf")
     stale_evals = 0
     grad_norm_hist: deque[float] = deque(maxlen=cfg.plateau_patience_evals)
     val_ce_hist: deque[float] = deque(maxlen=cfg.plateau_patience_evals)
 
     for step in range(start_step, cfg.steps + 1):
         t0 = time.time()
-        train_loss = float("nan")
+        train_total = float("nan")
+        train_ce = float("nan")
+        train_future = float("nan")
+        train_future_lambda = float("nan")
+        train_rollout = float("nan")
+        train_semantic = float("nan")
+        loss_phase = "ce"
         raw_grad_norm = float("nan")
 
         if step > 0:
             model.train()
-            x, y = get_batch(train_data, cfg.window, cfg.batch_size, DEVICE)
+            future_lambda_now, future_lambda_anchor = _resolve_future_lambda(cfg, train_loss_ema, future_lambda_anchor)
 
             with _autocast_context():
-                loss = model(x, targets=y)
+                loss, loss_stats = _compute_train_loss(
+                    model,
+                    train_data,
+                    cfg,
+                    step,
+                    future_lambda=future_lambda_now,
+                )
 
             optimizer.zero_grad(set_to_none=True)
             step_applied = False
@@ -445,8 +939,21 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
 
             if step_applied:
                 scheduler.step()
-                train_loss = float(loss.item())
-                train_loss_ema = train_loss if train_loss_ema is None else 0.95 * train_loss_ema + 0.05 * train_loss
+                train_total = loss_stats.total
+                train_ce = loss_stats.ce
+                train_future = loss_stats.future
+                train_future_lambda = loss_stats.future_lambda
+                train_rollout = loss_stats.rollout
+                train_semantic = loss_stats.semantic
+                loss_phase = loss_stats.phase
+                train_loss_ema = train_ce if train_loss_ema is None else 0.95 * train_loss_ema + 0.05 * train_ce
+                if (
+                    future_lambda_anchor is None
+                    and cfg.future_summary_ce_target is not None
+                    and train_loss_ema is not None
+                    and math.isfinite(train_loss_ema)
+                ):
+                    future_lambda_anchor = max(float(train_loss_ema), float(cfg.future_summary_ce_target) + 1e-6)
                 if cfg.diagnostics and not math.isnan(raw_grad_norm):
                     grad_norm_hist.append(raw_grad_norm)
 
@@ -460,6 +967,30 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
 
         if step % cfg.eval_interval == 0:
             ce, ppl = eval_deterministic(model, val_data, cfg.window, cfg.batch_size)
+            best_val_ce = min(best_val_ce, ce)
+            val_future_summary = float("nan")
+            val_future_examples = 0
+            if cfg.future_summary_horizons and cfg.future_summary_eval_batches > 0:
+                val_future_summary, val_future_examples = eval_future_summary_deterministic(
+                    model,
+                    val_data,
+                    cfg.window,
+                    cfg.batch_size,
+                    cfg.future_summary_horizons,
+                    cfg.future_summary_eval_batches,
+                )
+            val_rollout_ce = float("nan")
+            val_semantic = float("nan")
+            val_rollout_examples = 0
+            if cfg.rollout_horizon > 0 and cfg.rollout_eval_batches > 0:
+                val_rollout_ce, val_semantic, val_rollout_examples = eval_rollout_deterministic(
+                    model,
+                    val_data,
+                    cfg.window,
+                    cfg.batch_size,
+                    cfg.rollout_horizon,
+                    cfg.rollout_eval_batches,
+                )
             if cfg.diagnostics:
                 val_ce_hist.append(ce)
                 improved = ce < (best_ce - cfg.min_improve_ce)
@@ -471,8 +1002,59 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
 
             if ppl < best_ppl:
                 best_ppl = ppl
-                if ckpt_path is not None:
-                    save_checkpoint(ckpt_path, model, optimizer, step, best_ppl)
+                if ckpt_targets is not None:
+                    save_checkpoint(
+                        ckpt_targets.best_ppl,
+                        model,
+                        optimizer,
+                        step,
+                        best_ppl,
+                        extra_metadata={
+                            "selection_metric": "best_ppl",
+                            "val_ce": ce,
+                            "val_ppl": ppl,
+                            "val_future_summary": val_future_summary,
+                            "val_rollout_ce": val_rollout_ce,
+                            "val_semantic": val_semantic,
+                        },
+                    )
+            if ckpt_targets is not None and val_rollout_examples > 0 and val_rollout_ce < best_rollout_ce:
+                best_rollout_ce = val_rollout_ce
+                save_checkpoint(
+                    ckpt_targets.best_rollout,
+                    model,
+                    optimizer,
+                    step,
+                    best_ppl,
+                    extra_metadata={
+                        "selection_metric": "best_rollout",
+                        "val_ce": ce,
+                        "val_ppl": ppl,
+                        "val_future_summary": val_future_summary,
+                        "val_rollout_ce": val_rollout_ce,
+                        "val_semantic": val_semantic,
+                    },
+                )
+            useful_ok = val_rollout_examples > 0 and ce <= (best_val_ce + cfg.rollout_useful_ce_tol)
+            if ckpt_targets is not None and useful_ok and val_rollout_ce < best_useful_rollout_ce:
+                best_useful_rollout_ce = val_rollout_ce
+                save_checkpoint(
+                    ckpt_targets.best_useful,
+                    model,
+                    optimizer,
+                    step,
+                    best_ppl,
+                    extra_metadata={
+                        "selection_metric": "best_useful",
+                        "val_ce": ce,
+                        "val_ppl": ppl,
+                        "val_future_summary": val_future_summary,
+                        "val_rollout_ce": val_rollout_ce,
+                        "val_semantic": val_semantic,
+                        "guardrail_best_val_ce": best_val_ce,
+                        "guardrail_ce_tol": cfg.rollout_useful_ce_tol,
+                    },
+                )
 
             if step_times:
                 avg_ms = (sum(step_times) / len(step_times)) * 1000.0
@@ -483,8 +1065,12 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                 avg_ms_str = "N/A"
                 tok_s_str = "N/A"
             lr_now = optimizer.param_groups[0]["lr"]
-            if cfg.report_bpc:
-                train_str = "N/A" if math.isnan(train_loss) else f"{ce_to_bpc(train_loss):.4f}"
+            aux_enabled = (
+                (bool(cfg.future_summary_horizons) and cfg.future_summary_lambda > 0.0)
+                or (cfg.rollout_horizon > 0 and (cfg.rollout_lambda > 0.0 or cfg.semantic_lambda > 0.0))
+            )
+            if cfg.report_bpc and not aux_enabled:
+                train_str = "N/A" if math.isnan(train_ce) else f"{ce_to_bpc(train_ce):.4f}"
                 train_ema_str = "N/A" if train_loss_ema is None else f"{ce_to_bpc(train_loss_ema):.4f}"
                 LOG.info(
                     "step=%5d | train_bpc=%s | train_bpc_ema=%s | val_bpc=%.4f | val_ppl=%.2f | best_ppl=%.2f | lr=%.2e | %s ms/step | %s tok/s",
@@ -498,8 +1084,34 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                     avg_ms_str,
                     tok_s_str,
                 )
-            else:
-                train_str = "N/A" if math.isnan(train_loss) else f"{train_loss:.4f}"
+            elif cfg.report_bpc and aux_enabled:
+                train_total_str = "N/A" if math.isnan(train_total) else f"{train_total:.4f}"
+                train_bpc_str = "N/A" if math.isnan(train_ce) else f"{ce_to_bpc(train_ce):.4f}"
+                train_ema_str = "N/A" if train_loss_ema is None else f"{ce_to_bpc(train_loss_ema):.4f}"
+                future_str = "N/A" if math.isnan(train_future) else f"{train_future:.4f}"
+                future_lambda_str = "N/A" if math.isnan(train_future_lambda) else f"{train_future_lambda:.4f}"
+                rollout_str = "N/A" if math.isnan(train_rollout) else f"{train_rollout:.4f}"
+                semantic_str = "N/A" if math.isnan(train_semantic) else f"{train_semantic:.4f}"
+                LOG.info(
+                    "step=%5d | phase=%s | train_total=%s | train_bpc=%s | train_bpc_ema=%s | train_future=%s | future_lambda=%s | train_rollout=%s | train_sem=%s | val_bpc=%.4f | val_ppl=%.2f | best_ppl=%.2f | lr=%.2e | %s ms/step | %s tok/s",
+                    step,
+                    loss_phase,
+                    train_total_str,
+                    train_bpc_str,
+                    train_ema_str,
+                    future_str,
+                    future_lambda_str,
+                    rollout_str,
+                    semantic_str,
+                    ce_to_bpc(ce),
+                    ppl,
+                    best_ppl,
+                    lr_now,
+                    avg_ms_str,
+                    tok_s_str,
+                )
+            elif not aux_enabled:
+                train_str = "N/A" if math.isnan(train_ce) else f"{train_ce:.4f}"
                 train_ema_str = "N/A" if train_loss_ema is None else f"{train_loss_ema:.4f}"
                 LOG.info(
                     "step=%5d | train_ce=%s | train_ce_ema=%s | val_ce=%.4f | val_ppl=%.2f | best_ppl=%.2f | lr=%.2e | %s ms/step | %s tok/s",
@@ -513,6 +1125,56 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                     avg_ms_str,
                     tok_s_str,
                 )
+            else:
+                train_total_str = "N/A" if math.isnan(train_total) else f"{train_total:.4f}"
+                train_ce_str = "N/A" if math.isnan(train_ce) else f"{train_ce:.4f}"
+                train_ema_str = "N/A" if train_loss_ema is None else f"{train_loss_ema:.4f}"
+                future_str = "N/A" if math.isnan(train_future) else f"{train_future:.4f}"
+                future_lambda_str = "N/A" if math.isnan(train_future_lambda) else f"{train_future_lambda:.4f}"
+                rollout_str = "N/A" if math.isnan(train_rollout) else f"{train_rollout:.4f}"
+                semantic_str = "N/A" if math.isnan(train_semantic) else f"{train_semantic:.4f}"
+                LOG.info(
+                    "step=%5d | phase=%s | train_total=%s | train_ce=%s | train_ce_ema=%s | train_future=%s | future_lambda=%s | train_rollout=%s | train_sem=%s | val_ce=%.4f | val_ppl=%.2f | best_ppl=%.2f | lr=%.2e | %s ms/step | %s tok/s",
+                    step,
+                    loss_phase,
+                    train_total_str,
+                    train_ce_str,
+                    train_ema_str,
+                    future_str,
+                    future_lambda_str,
+                    rollout_str,
+                    semantic_str,
+                    ce,
+                    ppl,
+                    best_ppl,
+                    lr_now,
+                    avg_ms_str,
+                    tok_s_str,
+                )
+            if val_future_examples > 0:
+                LOG.info(
+                    "future_eval | step=%5d | val_future=%.4f | examples=%d | horizons=%s",
+                    step,
+                    val_future_summary,
+                    val_future_examples,
+                    future_horizons_str,
+                )
+            if val_rollout_examples > 0:
+                LOG.info(
+                    "rollout_eval | step=%5d | val_rollout_ce=%.4f | val_sem=%.4f | examples=%d | mode=argmax",
+                    step,
+                    val_rollout_ce,
+                    val_semantic,
+                    val_rollout_examples,
+                )
+                if ckpt_targets is not None:
+                    LOG.info(
+                        "checkpoint_metrics | best_rollout_ce=%.4f | best_useful_rollout_ce=%.4f | best_val_ce=%.4f | useful_ce_tol=%.4f",
+                        best_rollout_ce,
+                        best_useful_rollout_ce,
+                        best_val_ce,
+                        cfg.rollout_useful_ce_tol,
+                    )
             if cfg.diagnostics:
                 grad_stats = _collect_grad_stats(model, topk=cfg.grad_topk)
                 top_grad = ", ".join(f"{n}={v:.2e}" for n, v in grad_stats["top_grad_params"]) or "none"

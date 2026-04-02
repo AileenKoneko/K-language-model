@@ -37,6 +37,7 @@ class ModelConfig:
     head_mode: str
     head_mult: int
     head_dropout: float
+    future_summary_horizons: tuple[int, ...] = ()
     adaptive_cutoffs: tuple[int, ...] = ()
     adaptive_div_value: float = 4.0
     alpha_cap: float = 1.0

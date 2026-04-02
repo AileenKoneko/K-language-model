@@ -15,6 +15,20 @@ def parse_adaptive_cutoffs(raw: str | None) -> list[int] | None:
     return parsed or None
 
 
+def parse_int_list(raw: str | None) -> tuple[int, ...]:
+    if raw is None:
+        return ()
+    values = []
+    for part in raw.split(","):
+        stripped = part.strip()
+        if not stripped:
+            continue
+        value = int(stripped)
+        if value > 0:
+            values.append(value)
+    return tuple(sorted(set(values)))
+
+
 def build_model(config: ModelConfig) -> KStackModel:
     if config.k_base_rank > 0:
         LOG.warning("k_base_rank is currently reserved on the V2 branch; the conv k_base implementation ignores it.")
@@ -34,6 +48,7 @@ def build_model(config: ModelConfig) -> KStackModel:
         head_mode=config.head_mode,
         head_mult=config.head_mult,
         head_dropout=config.head_dropout,
+        future_summary_horizons=list(config.future_summary_horizons),
         adaptive_cutoffs=list(config.adaptive_cutoffs),
         adaptive_div_value=config.adaptive_div_value,
         alpha_cap=config.alpha_cap,
@@ -55,7 +70,13 @@ def model_config_from_args(
     mlp_dropout: float,
     residual_dropout: float,
 ) -> ModelConfig:
+    future_summary_horizons = parse_int_list(getattr(args, "future_summary_horizons", None))
+    if not future_summary_horizons:
+        single_horizon = int(getattr(args, "future_summary_horizon", 0) or 0)
+        if single_horizon > 0:
+            future_summary_horizons = (single_horizon,)
     return ModelConfig(
+        future_summary_horizons=future_summary_horizons,
         vocab_size=vocab_size,
         window=args.window,
         d_model=args.d_model,

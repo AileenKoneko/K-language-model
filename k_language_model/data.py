@@ -25,7 +25,7 @@ from .dataset_loaders import (
     read_bytes,
     read_text,
 )
-from .dataset_pipeline import DatasetBundle, get_batch, load_dataset_bundle
+from .dataset_pipeline import DatasetBundle, get_batch, get_rollout_batch, load_dataset_bundle
 from .tokenizers import ByteTokenizer, CharTokenizer, FrequencyRemappedTokenizer, SentencePieceTokenizer, TextTokenizer
 
 
@@ -100,6 +100,7 @@ __all__ = [
     "download_wikitext2",
     "download_wikitext2_raw",
     "get_batch",
+    "get_rollout_batch",
     "load_dataset",
     "load_dataset_bundle",
     "load_full_shakespeare",

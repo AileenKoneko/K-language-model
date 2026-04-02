@@ -1,7 +1,7 @@
 import math
 import random
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -99,18 +99,46 @@ def _coerce_rng_tensor_list(value: object) -> List[torch.Tensor] | None:
     return tensors
 
 
-def save_checkpoint(path: Path, model: nn.Module, optimizer: torch.optim.Optimizer, step: int, best_ppl: float) -> None:
-    torch.save(
-        {
-            "step": step,
-            "best_ppl": best_ppl,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "rng_state": _capture_rng_state(),
-        },
-        path,
-    )
-    LOG.info("Checkpoint saved | step=%d | best_ppl=%.3f | path=%s", step, best_ppl, path)
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    best_ppl: float,
+    *,
+    extra_metadata: Dict[str, Any] | None = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "step": step,
+        "best_ppl": best_ppl,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "rng_state": _capture_rng_state(),
+    }
+    if extra_metadata:
+        payload.update(extra_metadata)
+    torch.save(payload, path)
+    meta_suffix = ""
+    if extra_metadata:
+        parts = []
+        if "selection_metric" in extra_metadata:
+            parts.append(f"selection={extra_metadata['selection_metric']}")
+        if "val_rollout_ce" in extra_metadata:
+            parts.append(f"val_rollout_ce={float(extra_metadata['val_rollout_ce']):.4f}")
+        if "val_ce" in extra_metadata:
+            parts.append(f"val_ce={float(extra_metadata['val_ce']):.4f}")
+        if parts:
+            meta_suffix = " | " + " | ".join(parts)
+    LOG.info("Checkpoint saved | step=%d | best_ppl=%.3f%s | path=%s", step, best_ppl, meta_suffix, path)
+
+
+def load_checkpoint_metadata(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(ck, dict):
+        return {}
+    return dict(ck)
 
 
 def _normalize_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:

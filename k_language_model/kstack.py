@@ -252,6 +252,7 @@ class KStackModel(nn.Module):
         head_mode: str = "linear",
         head_mult: int = 6,
         head_dropout: float = 0.0,
+        future_summary_horizons: List[int] | None = None,
         adaptive_cutoffs: List[int] | None = None,
         adaptive_div_value: float = 4.0,
         alpha_cap: float = 1.0,
@@ -269,6 +270,7 @@ class KStackModel(nn.Module):
         self.emb_dim = self.d_model if emb_dim is None else max(int(emb_dim), 1)
         self.head_mode = str(head_mode)
         self.head_mult = int(head_mult)
+        self.future_summary_horizons = tuple(sorted({int(h) for h in (future_summary_horizons or []) if int(h) > 0}))
         self.k_base_rank = max(int(k_base_rank), 0)
         self.k_base_impl = resolve_kbase_impl_name(k_base_impl)
         self.k_base_kernel_size = max(int(k_base_kernel_size), 1)
@@ -315,6 +317,19 @@ class KStackModel(nn.Module):
         self.tie_weights = self.head.tie_weights
         self.adaptive_cutoffs = list(self.head.adaptive_cutoffs)
         self.adaptive_div_value = float(self.head.adaptive_div_value)
+        if self.future_summary_horizons:
+            predictor_hidden = self.d_model * 2
+            self.future_summary_norm = RMSNorm(self.d_model)
+            self.future_summary_up = nn.Linear(self.d_model, predictor_hidden)
+            self.future_summary_activation = nn.GELU()
+            self.future_summary_heads = nn.ModuleDict(
+                {str(h): nn.Linear(predictor_hidden, self.d_model) for h in self.future_summary_horizons}
+            )
+        else:
+            self.future_summary_norm = None
+            self.future_summary_up = None
+            self.future_summary_activation = None
+            self.future_summary_heads = nn.ModuleDict()
 
         self.apply(self._init_weights)
 
@@ -385,6 +400,18 @@ class KStackModel(nn.Module):
                 continue
             adapted[key] = resize_kernel(tensor, self.k_base_kernel_size)
 
+        if not self.future_summary_horizons:
+            for key in list(adapted.keys()):
+                if key.startswith("future_summary_"):
+                    adapted.pop(key, None)
+        else:
+            valid_head_prefixes = {f"future_summary_heads.{h}." for h in self.future_summary_horizons}
+            for key in list(adapted.keys()):
+                if key.startswith("future_summary_heads.") and not any(
+                    key.startswith(prefix) for prefix in valid_head_prefixes
+                ):
+                    adapted.pop(key, None)
+
         return self.head.adapt_state_dict(adapted)
 
     def describe_rosa_layers(self) -> str:
@@ -408,10 +435,27 @@ class KStackModel(nn.Module):
         h = self.k_stack(h, rosa_h=rosa_h, rosa_layer_mask=self.rosa_k2_layer_mask)
         return self.norm(h)
 
+    def predict_future_summaries(self, h: torch.Tensor) -> Dict[int, torch.Tensor]:
+        if not self.future_summary_horizons or self.future_summary_norm is None or self.future_summary_up is None:
+            return {}
+        shared = self.future_summary_norm(h)
+        shared = self.future_summary_up(shared)
+        shared = self.future_summary_activation(shared)
+        return {int(key): head(shared) for key, head in self.future_summary_heads.items()}
+
     def _loss_from_hidden(self, h: torch.Tensor, targets: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
         if reduction not in {"mean", "sum"}:
             raise ValueError(f"Unsupported reduction: {reduction}")
         return self.head.loss(h, targets, reduction=reduction)
+
+    def hidden_states(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_hidden(x)
+
+    def scores_from_hidden(self, h: torch.Tensor) -> torch.Tensor:
+        return self.head.scores(h)
+
+    def loss_from_hidden(self, h: torch.Tensor, targets: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+        return self._loss_from_hidden(h, targets, reduction=reduction)
 
     def forward(
         self,

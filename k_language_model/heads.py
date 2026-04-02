@@ -157,6 +157,68 @@ class GeluHead(HeadImplementation):
 
 
 @register_head
+class TrajectoryHead(HeadImplementation):
+    name = "trajectory"
+
+    def __init__(self, *, embedding: nn.Embedding, **kwargs):
+        super().__init__(embedding=embedding, **kwargs)
+        hidden = max(self.d_model, self.head_mult * self.d_model)
+        self.kernel_size = 5
+        self.state_norm = RMSNorm(self.d_model)
+        self.delta_norm = RMSNorm(self.d_model)
+        self.accel_norm = RMSNorm(self.d_model)
+        self.local_norm = RMSNorm(self.d_model)
+        self.local_conv = nn.Conv1d(
+            in_channels=self.d_model,
+            out_channels=self.d_model,
+            kernel_size=self.kernel_size,
+            groups=self.d_model,
+            bias=False,
+        )
+        feature_dim = self.d_model * 4
+        self.gate = nn.Linear(feature_dim, self.d_model)
+        self.up = nn.Linear(feature_dim, hidden)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(self.head_dropout) if self.head_dropout > 0 else nn.Identity()
+        self.down = nn.Linear(hidden, self.d_model)
+        if self.emb_dim != self.d_model:
+            self.output_projection = nn.Linear(self.d_model, self.emb_dim, bias=False)
+        self.head = nn.Linear(self.emb_dim, self.vocab_size, bias=False)
+        self.head.weight = embedding.weight
+        self.tie_weights = True
+
+    def _features(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        state = self.state_norm(hidden)
+
+        prev_hidden = F.pad(hidden[:, :-1, :], (0, 0, 1, 0))
+        raw_delta = hidden - prev_hidden
+        delta = self.delta_norm(raw_delta)
+
+        prev_delta = F.pad(raw_delta[:, :-1, :], (0, 0, 1, 0))
+        accel = self.accel_norm(raw_delta - prev_delta)
+
+        local_in = F.pad(state.transpose(1, 2), (self.kernel_size - 1, 0))
+        local = self.local_conv(local_in).transpose(1, 2)
+        local = self.local_norm(local)
+
+        return torch.cat((state, delta, accel, local), dim=-1), state
+
+    def scores(self, hidden: torch.Tensor) -> torch.Tensor:
+        features, state = self._features(hidden)
+        proposal = self.up(features)
+        proposal = self.activation(proposal)
+        proposal = self.dropout(proposal)
+        proposal = self.down(proposal)
+        gate = torch.sigmoid(self.gate(features))
+        mixed = state + gate * proposal
+        return self.head(self.output_projection(mixed))
+
+    def loss(self, hidden: torch.Tensor, targets: torch.Tensor, reduction: str) -> torch.Tensor:
+        scores = self.scores(hidden)
+        return F.cross_entropy(scores.reshape(-1, self.vocab_size), targets.reshape(-1), reduction=reduction)
+
+
+@register_head
 class AdaptiveHead(HeadImplementation):
     name = "adaptive"
 

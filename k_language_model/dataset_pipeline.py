@@ -226,3 +226,36 @@ def get_batch(data: torch.Tensor, window: int, batch_size: int, device: str) -> 
         x = x.to(dst_device, non_blocking=True)
         y = y.to(dst_device, non_blocking=True)
     return x, y
+
+
+def get_rollout_batch(
+    data: torch.Tensor,
+    window: int,
+    horizon: int,
+    batch_size: int,
+    device: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if horizon <= 0:
+        raise ValueError(f"horizon must be > 0, got {horizon}.")
+    total_len = window + horizon + 1
+    if len(data) <= total_len:
+        raise ValueError(f"Data length ({len(data)}) must be > window+horizon+1 ({total_len}).")
+
+    src_device = data.device
+    ix = torch.randint(len(data) - total_len, (batch_size,), device=src_device)
+    offsets = torch.arange(total_len, device=src_device)
+    pos = ix.unsqueeze(1) + offsets.unsqueeze(0)
+    seq = data.index_select(0, pos.reshape(-1)).view(batch_size, total_len)
+
+    teacher_x = seq[:, :window]
+    teacher_y = seq[:, 1: window + 1]
+    rollout_prefix = seq[:, 1: window + 1]
+    true_chunk = seq[:, window + 1:]
+
+    dst_device = torch.device(device)
+    if teacher_x.device != dst_device:
+        teacher_x = teacher_x.to(dst_device, non_blocking=True)
+        teacher_y = teacher_y.to(dst_device, non_blocking=True)
+        rollout_prefix = rollout_prefix.to(dst_device, non_blocking=True)
+        true_chunk = true_chunk.to(dst_device, non_blocking=True)
+    return teacher_x, teacher_y, rollout_prefix, true_chunk

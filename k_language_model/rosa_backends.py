@@ -78,6 +78,22 @@ class GpuApproxRosaBackend(RosaBackend):
 
 
 @register_rosa_backend
+class NgramCacheRosaBackend(RosaBackend):
+    name = "ngram_cache"
+
+    def next_token_ids(self, token_ids: torch.Tensor, *, vocab_size: int) -> torch.Tensor | None:
+        return rosa_next_token_ids_batch(token_ids, impl="ngram_cache")
+
+
+@register_rosa_backend
+class CopyPriorRosaBackend(RosaBackend):
+    name = "copy_prior"
+
+    def next_token_ids(self, token_ids: torch.Tensor, *, vocab_size: int) -> torch.Tensor | None:
+        return rosa_next_token_ids_batch(token_ids, impl="copy_prior")
+
+
+@register_rosa_backend
 class AutoRosaBackend(RosaBackend):
     name = "auto"
 

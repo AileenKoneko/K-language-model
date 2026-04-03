@@ -141,3 +141,17 @@ def test_ingest_infer_eval_message_updates_summary() -> None:
     assert job.summary_stats["step"] == "7500"
     assert job.summary_stats["val_ce"] == "3.1148"
     assert job.summary_stats["eval_tok_s"] == "51234"
+
+
+def test_ingest_sample_stream_message_sets_sampling_phase() -> None:
+    job = _make_job()
+    job.mode = "infer"
+    _ingest_job_output_message(
+        job,
+        "INFO",
+        "Sample stream | enabled=true | interval_tokens=4 | tty=false",
+    )
+
+    assert job.phase == "sampling"
+    assert job.summary_stats["interval_tokens"] == "4"
+    assert job.summary_stats["tty"] == "false"

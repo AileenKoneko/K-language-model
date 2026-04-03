@@ -103,6 +103,22 @@ def add_model_args(parser: argparse.ArgumentParser, *, include_dropouts: bool, a
     parser.add_argument("--head-mult", type=int, default=6)
     parser.add_argument("--head-dropout", type=float, default=0.10)
     parser.add_argument(
+        "--trajectory-aux",
+        dest="trajectory_aux",
+        action="store_true",
+        help=(
+            "Attach an auxiliary trajectory head alongside the primary head. "
+            "Its objective is controlled by --trajectory-aux-lambda."
+        ),
+    )
+    parser.add_argument(
+        "--no-trajectory-aux",
+        dest="trajectory_aux",
+        action="store_false",
+        help="Disable the auxiliary trajectory head.",
+    )
+    parser.set_defaults(trajectory_aux=False)
+    parser.add_argument(
         "--adaptive-cutoffs",
         type=str,
         default=None,
@@ -195,7 +211,12 @@ def add_experimental_objective_args(parser: argparse.ArgumentParser) -> None:
         "--future-summary-horizons",
         type=str,
         default=None,
-        help="Comma-separated future-summary horizons, for example 8,32,128. Overrides --future-summary-horizon when provided.",
+        help=(
+            "Comma-separated future-summary horizons, for example 8,32,128. "
+            "Use token 'gamma' to derive horizons dynamically from learned K2 decay gammas "
+            "(uses first K2 layer; ignores numeric horizon inputs). "
+            "Overrides --future-summary-horizon when provided."
+        ),
     )
     parser.add_argument(
         "--future-summary-horizon",
@@ -228,6 +249,14 @@ def add_experimental_objective_args(parser: argparse.ArgumentParser) -> None:
         help="Optional CE anchor for future-summary lambda decay. If omitted, the EMA at future-loss activation is used.",
     )
     parser.add_argument(
+        "--future-summary-shortest-as-ce",
+        action="store_true",
+        help=(
+            "Gamma mode only: replace base CE with CE weighted by the shortest learned horizon weight. "
+            "The shortest horizon is removed from future-summary auxiliary horizons to avoid duplicate local pressure."
+        ),
+    )
+    parser.add_argument(
         "--future-summary-start-step",
         type=int,
         default=None,
@@ -238,6 +267,12 @@ def add_experimental_objective_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=16,
         help="Number of deterministic validation batches used for future-summary eval. 0 disables future-summary eval logging.",
+    )
+    parser.add_argument(
+        "--trajectory-aux-lambda",
+        type=float,
+        default=0.0,
+        help="Weight for auxiliary trajectory-head CE added on top of base CE (0 disables).",
     )
     parser.add_argument(
         "--rollout-horizon",

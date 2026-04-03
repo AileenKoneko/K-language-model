@@ -4,9 +4,19 @@ import torch
 
 from k_language_model.model import K2Layer, KStackModel
 from k_language_model.train_app import _build_model, build_parser
+from k_language_model.trainer import _collect_k_layer_stats
 
 
 class ModelV2Tests(unittest.TestCase):
+    def test_k2_layer_gamma_init_starts_at_half_and_respects_clamp(self) -> None:
+        layer = K2Layer(window=16, d=8, rank=4, gamma_min=0.05, gamma_max=0.95)
+        gamma = layer.decay_gamma()
+        torch.testing.assert_close(gamma, torch.full((4,), 0.5, dtype=gamma.dtype), rtol=0.0, atol=0.0)
+
+        clipped = K2Layer(window=16, d=8, rank=4, gamma_min=0.7, gamma_max=0.9)
+        gamma_clipped = clipped.decay_gamma()
+        torch.testing.assert_close(gamma_clipped, torch.full((4,), 0.7, dtype=gamma_clipped.dtype), rtol=0.0, atol=0.0)
+
     def test_k2_layer_v2_block_decay_matches_mask(self) -> None:
         torch.manual_seed(0)
         inputs = torch.randn(2, 64, 8)
@@ -65,6 +75,29 @@ class ModelV2Tests(unittest.TestCase):
         self.assertEqual(logits.shape, (2, 16, 32))
         self.assertTrue(torch.isfinite(logits).all().item())
         self.assertTrue(torch.isfinite(loss).item())
+        self.assertTrue(hasattr(model.k_stack, "decay_logit"))
+        gamma = model.k_stack.decay_gamma()
+        torch.testing.assert_close(gamma, torch.tensor([0.2, 0.5, 0.8], dtype=gamma.dtype), rtol=1e-6, atol=1e-6)
+        k2_layers = [layer for layer in model.k_stack.layers if isinstance(layer, K2Layer)]
+        self.assertGreater(len(k2_layers), 0)
+        self.assertFalse(any(hasattr(layer, "decay_logit") for layer in k2_layers))
+
+    def test_k_layer_stats_include_kappa_summary(self) -> None:
+        model = KStackModel(
+            vocab_size=32,
+            window=16,
+            d=8,
+            emb_dim=8,
+            rank=3,
+            n_k2=1,
+            emb_dropout=0.0,
+            mlp_dropout=0.0,
+            residual_dropout=0.0,
+            rosa_impl="off",
+        )
+        stats = _collect_k_layer_stats(model)
+        self.assertIn("kappa[min/mean/max]=", stats)
+        self.assertIn("kappa[min/mean/max]=0.269/0.269/0.269", stats)
 
     def test_prepare_state_dict_projects_v1_shared_dense_k_base_to_kernel(self) -> None:
         model = KStackModel(
@@ -139,8 +172,10 @@ class ModelV2Tests(unittest.TestCase):
         state = model.state_dict()
         self.assertNotIn("k_stack.layers.1.causal_mask", state)
         self.assertNotIn("k_stack.layers.1.decay_diff", state)
-        self.assertEqual(tuple(model.k_stack.layers[1].causal_mask.shape), (8, 8))
-        self.assertEqual(tuple(model.k_stack.layers[1].decay_diff.shape), (8, 8))
+        self.assertNotIn("k_stack.causal_mask", state)
+        self.assertNotIn("k_stack.decay_diff", state)
+        self.assertEqual(tuple(model.k_stack.causal_mask.shape), (8, 8))
+        self.assertEqual(tuple(model.k_stack.decay_diff.shape), (8, 8))
 
         adapted = model.prepare_state_dict_for_load(
             {

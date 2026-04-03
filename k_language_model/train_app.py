@@ -16,7 +16,7 @@ from .configs import DatasetConfig
 from .data import load_dataset_bundle
 from .generation import sample_text
 from .model import resolve_adaptive_cutoffs
-from .model_factory import build_model, model_config_from_args, parse_adaptive_cutoffs, parse_int_list
+from .model_factory import build_model, model_config_from_args, parse_adaptive_cutoffs, parse_int_list, uses_gamma_horizons
 from .runtime import (
     DEVICE,
     LOG,
@@ -35,6 +35,7 @@ from .trainer import (
     _collect_k_layer_stats,
     ce_to_bpc,
     eval_deterministic,
+    eval_trajectory_deterministic,
     train_model,
 )
 
@@ -185,6 +186,12 @@ def main() -> None:
     LOG.info("Command | %s", _command_string())
     log_runtime_metadata()
     maybe_write_run_manifest(Path(args.run_manifest) if args.run_manifest else None, args)
+    if float(args.trajectory_aux_lambda) > 0.0 and not bool(args.trajectory_aux):
+        LOG.info("Enabling trajectory auxiliary head because trajectory_aux_lambda=%.4f > 0.", float(args.trajectory_aux_lambda))
+        args.trajectory_aux = True
+    if args.head_mode == "trajectory" and bool(args.trajectory_aux):
+        LOG.warning("Primary head_mode=trajectory already uses trajectory logits; disabling redundant trajectory_aux head.")
+        args.trajectory_aux = False
 
     remap_by_frequency = args.head_mode == "adaptive"
     dataset_config = DatasetConfig(
@@ -217,9 +224,30 @@ def main() -> None:
             str(remap_by_frequency).lower(),
         )
 
-    future_horizons = parse_int_list(args.future_summary_horizons)
-    if not future_horizons and int(args.future_summary_horizon) > 0:
+    future_horizon_raw = args.future_summary_horizons
+    future_gamma_horizons = uses_gamma_horizons(future_horizon_raw)
+    future_horizons = () if future_gamma_horizons else parse_int_list(future_horizon_raw)
+    if future_gamma_horizons and (future_horizons or int(args.future_summary_horizon) > 0):
+        LOG.warning(
+            "Future summary horizon mode 'gamma' enabled via --future-summary-horizons=%s; numeric horizon inputs are ignored.",
+            future_horizon_raw,
+        )
+    if not future_gamma_horizons and not future_horizons and int(args.future_summary_horizon) > 0:
         future_horizons = (int(args.future_summary_horizon),)
+    if not future_gamma_horizons and future_horizons:
+        filtered_horizons = tuple(h for h in future_horizons if 1 < int(h) < int(args.window))
+        if filtered_horizons != future_horizons:
+            dropped = ",".join(str(h) for h in future_horizons if h not in set(filtered_horizons))
+            LOG.warning(
+                "Future summary dropped invalid/duplicative horizons (%s); using horizons=%s (horizon 1 is excluded to avoid CE duplication).",
+                dropped or "none",
+                ",".join(str(h) for h in filtered_horizons) if filtered_horizons else "none",
+            )
+        future_horizons = filtered_horizons
+    if args.future_summary_shortest_as_ce and not future_gamma_horizons:
+        LOG.warning(
+            "--future-summary-shortest-as-ce is effective only with --future-summary-horizons gamma; ignoring in fixed horizon mode."
+        )
 
     cfg = TrainConfig(
         window=args.window,
@@ -248,14 +276,18 @@ def main() -> None:
         diagnostics=args.diagnostics,
         report_bpc=(args.dataset in {"wikitext2", "wikitext2_raw"} and tokenizer.is_character_level),
         future_summary_horizons=future_horizons,
+        future_summary_gamma_horizons=future_gamma_horizons,
+        future_summary_dataset_tokens=int(train_data.numel()),
         future_summary_lambda=max(float(args.future_summary_lambda), 0.0),
         future_summary_lambda_min=max(float(args.future_summary_lambda_min), 0.0),
+        trajectory_aux_lambda=(max(float(args.trajectory_aux_lambda), 0.0) if bool(args.trajectory_aux) else 0.0),
         future_summary_ce_target=(
             float(args.future_summary_ce_target) if args.future_summary_ce_target is not None else None
         ),
         future_summary_ce_anchor=(
             float(args.future_summary_ce_anchor) if args.future_summary_ce_anchor is not None else None
         ),
+        future_summary_shortest_as_ce=bool(args.future_summary_shortest_as_ce),
         future_summary_start_step=0,
         future_summary_eval_batches=max(int(args.future_summary_eval_batches), 0),
         rollout_horizon=max(int(args.rollout_horizon), 0),
@@ -267,7 +299,7 @@ def main() -> None:
         rollout_eval_batches=max(int(args.rollout_eval_batches), 0),
         rollout_useful_ce_tol=max(float(args.rollout_useful_ce_tol), 0.0),
     )
-    if cfg.future_summary_horizons and cfg.future_summary_lambda > 0.0:
+    if (cfg.future_summary_gamma_horizons or cfg.future_summary_horizons) and cfg.future_summary_lambda > 0.0:
         cfg.future_summary_start_step = (
             args.future_summary_start_step if args.future_summary_start_step is not None else args.warmup_steps
         )
@@ -311,12 +343,13 @@ def main() -> None:
             f"{params['other']:,}",
         )
         LOG.info(
-            "Model config | tokenizer=%s | emb_dim=%d | d_model=%d | tied_weights=%s | head_mode=%s | head_mult=%d | head_dropout=%.2f | k_base_rank=%d | k_base_impl=%s | share_k_base=%s | rosa_impl=%s | rosa_layers=%s | alpha_cap=%.2f | gamma[min/max]=%.3f/%.3f",
+            "Model config | tokenizer=%s | emb_dim=%d | d_model=%d | tied_weights=%s | head_mode=%s | trajectory_aux=%s | head_mult=%d | head_dropout=%.2f | k_base_rank=%d | k_base_impl=%s | share_k_base=%s | rosa_impl=%s | rosa_layers=%s | alpha_cap=%.2f | gamma[min/max]=%.3f/%.3f",
             tokenizer.describe(),
             model_for_stats.emb_dim,
             model_for_stats.d_model,
             str(getattr(model_for_stats, "tie_weights", False)).lower(),
             args.head_mode,
+            str(getattr(model_for_stats, "trajectory_aux", False)).lower(),
             args.head_mult,
             args.head_dropout,
             model_for_stats.k_base_rank,
@@ -342,6 +375,7 @@ def main() -> None:
         loaded_step, loaded_best_ppl = load_model_checkpoint(ckpt_path, model)
         core_model = _unwrap_model(model)
         ce, ppl = eval_deterministic(model, val_data, cfg.window, cfg.batch_size)
+        val_traj_ce, val_traj_tokens = eval_trajectory_deterministic(model, val_data, cfg.window, cfg.batch_size)
         loaded_step_str = "N/A" if loaded_step is None else str(loaded_step)
         loaded_best_ppl_str = "N/A" if loaded_best_ppl is None else f"{loaded_best_ppl:.2f}"
         if cfg.report_bpc:
@@ -360,6 +394,8 @@ def main() -> None:
                 ce,
                 ppl,
             )
+        if val_traj_tokens > 0:
+            LOG.info("Eval only trajectory | val_traj_ce=%.4f | tokens=%d", val_traj_ce, val_traj_tokens)
         if args.diagnostics:
             k_stats = _collect_k_layer_stats(model)
             if k_stats:

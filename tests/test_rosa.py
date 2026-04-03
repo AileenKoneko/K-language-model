@@ -58,6 +58,16 @@ def _rosa_reference(x: list[int]) -> list[int]:
     return y
 
 
+def _copy_prior_reference(x: list[int]) -> list[int]:
+    out = [-1] * len(x)
+    seen_next: dict[int, int] = {}
+    for i, token in enumerate(x):
+        out[i] = seen_next.get(token, -1)
+        if i + 1 < len(x):
+            seen_next[token] = x[i + 1]
+    return out
+
+
 def test_rosa_matches_reference_on_known_sequences() -> None:
     sequences = [
         [],
@@ -109,6 +119,44 @@ def test_rosa_batch_exact_matches_reference_on_known_sequences() -> None:
     output = rosa_next_token_ids_batch(token_ids, impl="exact")
 
     assert torch.equal(output, expected)
+
+
+def test_rosa_batch_copy_prior_matches_reference() -> None:
+    token_ids = torch.tensor(
+        [
+            [1, 2, 1, 2, 1, 2, 3],
+            [5, 5, 5, 5, 1, 5, 1],
+            [3, 1, 4, 1, 5, 9, 2],
+        ],
+        dtype=torch.int64,
+    )
+    expected = torch.tensor(
+        [_copy_prior_reference(row.tolist()) for row in token_ids],
+        dtype=torch.int64,
+    )
+
+    output = rosa_next_token_ids_batch(token_ids, impl="copy_prior")
+
+    assert torch.equal(output, expected)
+
+
+def test_rosa_batch_ngram_cache_stays_close_to_exact_on_repetitive_sequences() -> None:
+    token_ids = torch.tensor(
+        [
+            [1, 2, 1, 2, 1, 2, 3, 1, 2, 1, 2, 4, 1, 2, 5, 1],
+            [5, 5, 5, 5, 1, 5, 1, 5, 1, 5, 2, 5, 2, 5, 3, 5],
+            [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3],
+        ],
+        dtype=torch.int64,
+    )
+
+    exact = rosa_next_token_ids_batch(token_ids, impl="exact")
+    proxy = rosa_next_token_ids_batch(token_ids, impl="ngram_cache")
+
+    assert proxy.shape == token_ids.shape
+    assert proxy.dtype == torch.int64
+    diff_rate = float((proxy != exact).float().mean().item())
+    assert diff_rate <= 0.05
 
 
 def test_rosa_cpp_extension_probe_returns_bool() -> None:

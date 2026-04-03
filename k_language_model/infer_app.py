@@ -1,4 +1,5 @@
 import argparse
+import sys
 import time
 from pathlib import Path
 
@@ -59,6 +60,17 @@ def build_parser(description: str | None = None) -> argparse.ArgumentParser:
         strict_repro_help="Force strict reproducibility (disables compile, enables deterministic mode and disables TF32).",
     )
     add_sampling_args(p, include_sample_flag=False, include_skip_flags=True)
+    p.add_argument(
+        "--stream-sample",
+        action="store_true",
+        help="Stream sampled text incrementally to stdout during inference sampling.",
+    )
+    p.add_argument(
+        "--stream-interval-tokens",
+        type=int,
+        default=1,
+        help="Emit one stream update every N generated tokens when --stream-sample is enabled.",
+    )
     p.add_argument("--verbose", action="store_true")
     return p
 
@@ -166,12 +178,13 @@ def main() -> None:
             f"{params['other']:,}",
         )
         LOG.info(
-            "Model config | tokenizer=%s | emb_dim=%d | d_model=%d | tied_weights=%s | head_mode=%s | k_base_rank=%d | k_base_impl=%s | share_k_base=%s | rosa_impl=%s | rosa_layers=%s | gamma[min/max]=%.3f/%.3f",
+            "Model config | tokenizer=%s | emb_dim=%d | d_model=%d | tied_weights=%s | head_mode=%s | trajectory_aux=%s | k_base_rank=%d | k_base_impl=%s | share_k_base=%s | rosa_impl=%s | rosa_layers=%s | gamma[min/max]=%.3f/%.3f",
             tokenizer.describe(),
             core_model.emb_dim,
             core_model.d_model,
             str(getattr(core_model, "tie_weights", False)).lower(),
             args.head_mode,
+            str(getattr(core_model, "trajectory_aux", False)).lower(),
             core_model.k_base_rank,
             core_model.k_base_impl,
             str(getattr(core_model, "share_k_base", False)).lower(),
@@ -213,6 +226,26 @@ def main() -> None:
     if not args.skip_sample:
         top_k = args.top_k if args.top_k > 0 else None
         top_p = args.top_p if 0.0 < args.top_p < 1.0 else None
+        stream_interval_tokens = max(int(args.stream_interval_tokens), 1)
+        stream_emitted = False
+
+        def _stream_callback(_generated_tokens: int, stream_delta_text: str, _stream_full_text: str) -> None:
+            nonlocal stream_emitted
+            if not stream_delta_text:
+                return
+            stream_emitted = True
+            if sys.stdout.isatty():
+                sys.stdout.write(stream_delta_text)
+            else:
+                sys.stdout.write(stream_delta_text + "\n")
+            sys.stdout.flush()
+
+        if args.stream_sample:
+            LOG.info(
+                "Sample stream | enabled=true | interval_tokens=%d | tty=%s",
+                stream_interval_tokens,
+                str(sys.stdout.isatty()).lower(),
+            )
         prompt_tokens = len(tokenizer.encode(args.prompt))
         sample_t0 = time.perf_counter()
         text = sample_text(
@@ -227,7 +260,12 @@ def main() -> None:
             repetition_penalty=max(args.repetition_penalty, 1.0),
             repetition_window=args.repetition_window,
             prompt_lock_tokens=max(args.prompt_lock_tokens, 0),
+            on_stream=_stream_callback if args.stream_sample else None,
+            stream_interval_tokens=stream_interval_tokens,
         )
+        if args.stream_sample and stream_emitted and sys.stdout.isatty():
+            sys.stdout.write("\n")
+            sys.stdout.flush()
         sample_elapsed = max(time.perf_counter() - sample_t0, 1e-9)
         sample_tok_s = max(int(args.sample_tokens), 0) / sample_elapsed if args.sample_tokens > 0 else 0.0
         LOG.info(

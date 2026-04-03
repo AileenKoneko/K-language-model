@@ -41,9 +41,10 @@ class ModelConfig:
     adaptive_cutoffs: tuple[int, ...] = ()
     adaptive_div_value: float = 4.0
     alpha_cap: float = 1.0
-    gamma_min: float = 0.85
+    gamma_min: float = 0.05
     gamma_max: float = 1.0
     decay_impl: str = "mask"
+    trajectory_aux: bool = False
     rosa_impl: str = "off"
     rosa_layers: str | None = "all"
     k_base_kernel_size: int = 8

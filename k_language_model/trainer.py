@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from .checkpoint import load_checkpoint, load_checkpoint_metadata, save_checkpoint
 from .data import get_batch, get_rollout_batch
-from .model import KStackModel
+from .model import K2Layer, KStackModel
 from .runtime import AMP_DTYPE, DEVICE, LOG, USE_AMP, _autocast_context, _unwrap_model
 
 
@@ -58,6 +58,48 @@ def eval_deterministic(model: nn.Module, data: torch.Tensor, window: int, batch_
     return ce, ppl
 
 
+@torch.no_grad()
+def eval_trajectory_deterministic(
+    model: nn.Module,
+    data: torch.Tensor,
+    window: int,
+    batch_size: int,
+) -> tuple[float, int]:
+    model.eval()
+    core_model = _unwrap_model(model)
+    if getattr(core_model, "trajectory_aux_head", None) is None:
+        return float("nan"), 0
+
+    device_obj = torch.device(DEVICE)
+    if data.device != device_obj:
+        data = data.to(device_obj, non_blocking=True)
+    if not data.is_contiguous():
+        data = data.contiguous()
+
+    n_tokens = len(data) - 1
+    usable_tokens = (n_tokens // window) * window
+    if usable_tokens <= 0:
+        return float("nan"), 0
+
+    total_loss = 0.0
+    total_count = 0
+    x_all = data[:usable_tokens].view(-1, window)
+    y_all = data[1: usable_tokens + 1].view(-1, window)
+
+    for start in range(0, x_all.size(0), batch_size):
+        x = x_all[start: start + batch_size]
+        y = y_all[start: start + batch_size]
+        with _autocast_context():
+            hidden = core_model.hidden_states(x)
+            loss = core_model.trajectory_aux_loss_from_hidden(hidden, y, reduction="sum")
+        total_loss += float(loss.item())
+        total_count += int(y.numel())
+
+    if total_count <= 0:
+        return float("nan"), 0
+    return total_loss / total_count, total_count
+
+
 @dataclass
 class TrainConfig:
     window: int = 128
@@ -90,10 +132,14 @@ class TrainConfig:
     diagnostics: bool = False
     report_bpc: bool = False
     future_summary_horizons: tuple[int, ...] = ()
+    future_summary_gamma_horizons: bool = False
+    future_summary_dataset_tokens: int = 0
     future_summary_lambda: float = 0.05
     future_summary_lambda_min: float = 0.0
+    trajectory_aux_lambda: float = 0.0
     future_summary_ce_target: float | None = None
     future_summary_ce_anchor: float | None = None
+    future_summary_shortest_as_ce: bool = False
     future_summary_start_step: int = 0
     future_summary_eval_batches: int = 16
     rollout_horizon: int = 0
@@ -110,6 +156,8 @@ class TrainConfig:
 class StepLossStats:
     total: float
     ce: float
+    trajectory: float
+    trajectory_lambda: float
     future: float
     future_lambda: float
     rollout: float
@@ -153,8 +201,9 @@ def _metric_from_checkpoint(path: Path, key: str) -> float:
 
 
 def _resolve_loss_phase(cfg: TrainConfig, step: int) -> tuple[bool, bool, bool, str]:
+    future_enabled = bool(cfg.future_summary_gamma_horizons or cfg.future_summary_horizons)
     future_active = (
-        bool(cfg.future_summary_horizons)
+        future_enabled
         and cfg.future_summary_lambda > 0.0
         and step >= max(int(cfg.future_summary_start_step), 0)
     )
@@ -185,7 +234,7 @@ def _resolve_future_lambda(
     anchor: float | None,
 ) -> tuple[float, float | None]:
     lambda_max = max(float(cfg.future_summary_lambda), 0.0)
-    if not cfg.future_summary_horizons or lambda_max <= 0.0:
+    if not (cfg.future_summary_gamma_horizons or cfg.future_summary_horizons) or lambda_max <= 0.0:
         return 0.0, anchor
 
     lambda_min = min(max(float(cfg.future_summary_lambda_min), 0.0), lambda_max)
@@ -223,28 +272,158 @@ def _resolve_future_lambda(
     return lambda_eff, resolved_anchor
 
 
+def _resolve_gamma_horizons_and_weights(
+    core_model: KStackModel,
+    *,
+    window: int,
+    dataset_tokens: int | None = None,
+) -> tuple[tuple[int, ...], torch.Tensor]:
+    if window <= 1 or not hasattr(core_model, "k_stack") or not hasattr(core_model.k_stack, "layers"):
+        return (), torch.zeros(0, dtype=torch.float32)
+
+    source_layer = None
+    gamma = None
+    if hasattr(core_model.k_stack, "decay_gamma"):
+        gamma = core_model.k_stack.decay_gamma().detach().float()
+    if gamma is None:
+        for layer in core_model.k_stack.layers:
+            if isinstance(layer, K2Layer):
+                source_layer = layer
+                break
+        if source_layer is None:
+            return (), torch.zeros(0, dtype=torch.float32)
+        if hasattr(source_layer, "decay_gamma") and hasattr(source_layer, "decay_logit"):
+            gamma = source_layer.decay_gamma().detach().float()
+        elif hasattr(source_layer, "decay_logit"):
+            gamma_min = float(getattr(source_layer, "gamma_min", 0.0))
+            gamma_max = float(getattr(source_layer, "gamma_max", 1.0))
+            gamma = torch.sigmoid(source_layer.decay_logit.detach().float()).clamp(min=gamma_min, max=gamma_max)
+        else:
+            return (), torch.zeros(0, dtype=torch.float32)
+    gamma = gamma.clamp(min=1e-6, max=1.0 - 1e-6)
+    tau = 1.0 / (1.0 - gamma)
+    min_horizon = 1
+    max_horizon = max(int(window) - 1, 1)
+    if max_horizon < min_horizon:
+        return (), torch.zeros(0, dtype=torch.float32)
+    if dataset_tokens is None or int(dataset_tokens) <= max_horizon + 1:
+        horizons = torch.round(tau).to(dtype=torch.long)
+        horizons = horizons.clamp(min=min_horizon, max=max_horizon)
+    else:
+        tau_cap = max(float(int(dataset_tokens) - 1), float(max_horizon) + 1.0)
+        linear_cutoff = max(1.0, float(max_horizon) * 0.25)
+        projected = tau.clamp(min=1.0)
+
+        keep_linear = projected <= linear_cutoff
+        if (~keep_linear).any():
+            tau_tail = projected[~keep_linear].clamp(min=linear_cutoff, max=tau_cap)
+            denom = math.log(tau_cap / linear_cutoff)
+            if denom <= 1e-9:
+                projected[~keep_linear] = tau_tail
+            else:
+                ratio = torch.log(tau_tail / linear_cutoff) / denom
+                projected[~keep_linear] = linear_cutoff + ratio * (float(max_horizon) - linear_cutoff)
+        horizons = torch.round(projected).to(dtype=torch.long).clamp(min=min_horizon, max=max_horizon)
+    inv_tau = 1.0 - gamma
+
+    buckets: Dict[int, list[float]] = {}
+    for horizon, weight in zip(horizons.tolist(), inv_tau.tolist()):
+        buckets.setdefault(int(horizon), []).append(float(weight))
+    if not buckets:
+        return (), torch.zeros(0, dtype=torch.float32)
+
+    ordered_horizons = tuple(sorted(buckets.keys()))
+    weights = torch.tensor(
+        [sum(buckets[h]) / max(len(buckets[h]), 1) for h in ordered_horizons],
+        dtype=torch.float32,
+        device=gamma.device,
+    )
+    weights = weights.clamp(min=0.0)
+    weights_sum = float(weights.sum().item())
+    if weights_sum > 0.0:
+        weights = weights / weights.sum()
+    else:
+        weights.fill_(1.0 / float(max(int(weights.numel()), 1)))
+    return ordered_horizons, weights
+
+
+def _resolve_fixed_future_horizons(horizons: tuple[int, ...], *, window: int) -> tuple[int, ...]:
+    max_horizon = max(int(window) - 1, 1)
+    if max_horizon < 2:
+        return ()
+    return tuple(sorted({int(h) for h in horizons if 1 < int(h) <= max_horizon}))
+
+
+def _split_shortest_horizon_for_ce(
+    horizons: tuple[int, ...],
+    horizon_weights: torch.Tensor | None,
+) -> tuple[float, tuple[int, ...], torch.Tensor | None]:
+    if not horizons:
+        return 1.0, (), horizon_weights
+
+    shortest_idx = min(range(len(horizons)), key=lambda idx: int(horizons[idx]))
+    if horizon_weights is None or shortest_idx >= int(horizon_weights.numel()):
+        ce_weight = 1.0
+        aux_weights = horizon_weights
+    else:
+        ce_weight = float(horizon_weights[shortest_idx].item())
+        aux_weights = torch.cat((horizon_weights[:shortest_idx], horizon_weights[shortest_idx + 1:]), dim=0)
+        if int(aux_weights.numel()) > 0:
+            aux_weights = aux_weights.clamp(min=0.0)
+            denom = float(aux_weights.sum().item())
+            if denom > 0.0:
+                aux_weights = aux_weights / aux_weights.sum()
+            else:
+                aux_weights.fill_(1.0 / float(aux_weights.numel()))
+    aux_horizons = tuple(h for i, h in enumerate(horizons) if i != shortest_idx)
+    return ce_weight, aux_horizons, aux_weights
+
+
+def _format_horizon_list(horizons: tuple[int, ...]) -> str:
+    if not horizons:
+        return "none"
+    return ",".join(str(int(h)) for h in horizons)
+
+
+def _format_horizon_values(values: Dict[int, float], *, precision: int = 4) -> str:
+    if not values:
+        return "none"
+    return ",".join(f"{int(h)}:{float(values[h]):.{precision}f}" for h in sorted(values))
+
+
 def _compute_future_summary_loss(
     core_model: KStackModel,
     hidden: torch.Tensor,
     horizons: tuple[int, ...],
 ) -> torch.Tensor:
-    if not horizons or hidden.ndim != 3 or hidden.size(1) <= 1:
+    losses_by_horizon = _compute_future_summary_losses_by_horizon(core_model, hidden, horizons)
+    if not losses_by_horizon:
         return torch.zeros((), device=hidden.device, dtype=torch.float32)
+    return torch.stack(list(losses_by_horizon.values()), dim=0).mean()
+
+
+def _compute_future_summary_losses_by_horizon(
+    core_model: KStackModel,
+    hidden: torch.Tensor,
+    horizons: tuple[int, ...],
+) -> Dict[int, torch.Tensor]:
+    if not horizons or hidden.ndim != 3 or hidden.size(1) <= 1:
+        return {}
 
     predictors = core_model.predict_future_summaries(hidden)
     if not predictors:
-        return torch.zeros((), device=hidden.device, dtype=torch.float32)
+        return {}
 
     hidden_float = hidden.float()
     future = hidden_float.detach()[:, 1:, :]
     if future.size(1) <= 0:
-        return hidden_float.new_zeros(())
+        return {}
 
     zero = torch.zeros(future.size(0), 1, future.size(2), device=future.device, dtype=future.dtype)
     cumsum = torch.cat((zero, future.cumsum(dim=1)), dim=1)
-    losses = []
+    losses_by_horizon: Dict[int, torch.Tensor] = {}
     for horizon in horizons:
-        if horizon <= 0 or hidden.size(1) <= horizon or horizon not in predictors:
+        if horizon <= 1 or hidden.size(1) <= horizon or horizon not in predictors:
             continue
         target_sum = cumsum[:, horizon:, :] - cumsum[:, :-horizon, :]
         target_avg = target_sum / float(horizon)
@@ -254,11 +433,74 @@ def _compute_future_summary_loss(
 
         pred_direction = F.normalize(pred_direction, dim=-1, eps=1e-8)
         target_direction = F.normalize(target_direction, dim=-1, eps=1e-8)
-        losses.append(1.0 - (pred_direction * target_direction).sum(dim=-1).mean())
+        losses_by_horizon[int(horizon)] = 1.0 - (pred_direction * target_direction).sum(dim=-1).mean()
+    return losses_by_horizon
 
-    if not losses:
-        return hidden_float.new_zeros(())
-    return torch.stack(losses, dim=0).mean()
+def _compute_gamma_future_summary_loss(
+    hidden: torch.Tensor,
+    horizons: tuple[int, ...],
+    horizon_weights: torch.Tensor | None,
+) -> torch.Tensor:
+    losses_by_horizon = _compute_gamma_future_losses_by_horizon(hidden, horizons)
+    if not losses_by_horizon:
+        return torch.zeros((), device=hidden.device, dtype=torch.float32)
+
+    return _aggregate_gamma_future_losses(losses_by_horizon, horizons, horizon_weights, reference=hidden)
+
+
+def _aggregate_gamma_future_losses(
+    losses_by_horizon: Dict[int, torch.Tensor],
+    horizons: tuple[int, ...],
+    horizon_weights: torch.Tensor | None,
+    *,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    if not losses_by_horizon:
+        return torch.zeros((), device=reference.device, dtype=torch.float32)
+    ordered_horizons = [h for h in horizons if h in losses_by_horizon]
+    weighted_losses = []
+    weights = []
+    for idx, horizon in enumerate(ordered_horizons):
+        loss = losses_by_horizon[horizon]
+        if horizon_weights is None or idx >= int(horizon_weights.numel()):
+            weight = loss.new_tensor(1.0)
+        else:
+            weight = horizon_weights[idx].to(device=loss.device, dtype=loss.dtype).clamp(min=0.0)
+        weighted_losses.append(loss * weight)
+        weights.append(weight)
+
+    if not weighted_losses:
+        return torch.zeros((), device=reference.device, dtype=torch.float32)
+    total_weight = torch.stack(weights, dim=0).sum().clamp(min=1e-8)
+    return torch.stack(weighted_losses, dim=0).sum() / total_weight
+
+
+def _compute_gamma_future_losses_by_horizon(
+    hidden: torch.Tensor,
+    horizons: tuple[int, ...],
+) -> Dict[int, torch.Tensor]:
+    if not horizons or hidden.ndim != 3 or hidden.size(1) <= 1:
+        return {}
+
+    hidden_float = hidden.float()
+    future = hidden_float.detach()[:, 1:, :]
+    if future.size(1) <= 0:
+        return {}
+
+    zero = torch.zeros(future.size(0), 1, future.size(2), device=future.device, dtype=future.dtype)
+    cumsum = torch.cat((zero, future.cumsum(dim=1)), dim=1)
+    losses_by_horizon: Dict[int, torch.Tensor] = {}
+    for horizon in horizons:
+        if horizon <= 1 or hidden.size(1) <= horizon:
+            continue
+        target_sum = cumsum[:, horizon:, :] - cumsum[:, :-horizon, :]
+        target_avg = target_sum / float(horizon)
+        current = hidden_float[:, : hidden.size(1) - horizon, :]
+
+        pred = F.normalize(current, dim=-1, eps=1e-8)
+        target = F.normalize(target_avg, dim=-1, eps=1e-8)
+        losses_by_horizon[int(horizon)] = 1.0 - (pred * target).sum(dim=-1).mean()
+    return losses_by_horizon
 
 
 def _select_rollout_tokens(scores: torch.Tensor, mode: str) -> torch.Tensor:
@@ -333,13 +575,20 @@ def _compute_train_loss(
     future_lambda: float,
 ) -> tuple[torch.Tensor, StepLossStats]:
     rollout_active, semantic_active, future_active, phase = _resolve_loss_phase(cfg, step)
-    if not rollout_active and not future_active:
+    core_model = _unwrap_model(model)
+    trajectory_active = cfg.trajectory_aux_lambda > 0.0 and getattr(core_model, "trajectory_aux_head", None) is not None
+    if trajectory_active:
+        phase = f"{phase}+traj_aux"
+
+    if not rollout_active and not future_active and not trajectory_active:
         x, y = get_batch(train_data, cfg.window, cfg.batch_size, DEVICE)
         ce_loss = model(x, targets=y)
         ce_value = float(ce_loss.detach().item())
         return ce_loss, StepLossStats(
             total=ce_value,
             ce=ce_value,
+            trajectory=float("nan"),
+            trajectory_lambda=float("nan"),
             future=float("nan"),
             future_lambda=float("nan"),
             rollout=float("nan"),
@@ -347,7 +596,6 @@ def _compute_train_loss(
             phase=phase,
         )
 
-    core_model = _unwrap_model(model)
     if rollout_active:
         x, y, rollout_prefix, true_chunk = get_rollout_batch(
             train_data,
@@ -363,11 +611,31 @@ def _compute_train_loss(
 
     hidden = core_model.hidden_states(x)
     ce_loss = core_model.loss_from_hidden(hidden, y)
-    future_summary_loss = (
-        _compute_future_summary_loss(core_model, hidden, cfg.future_summary_horizons)
-        if future_active
+    trajectory_loss = (
+        core_model.trajectory_aux_loss_from_hidden(hidden, y)
+        if trajectory_active
         else ce_loss.new_zeros(())
     )
+    ce_weight = 1.0
+    if future_active:
+        if cfg.future_summary_gamma_horizons:
+            gamma_horizons, gamma_weights = _resolve_gamma_horizons_and_weights(
+                core_model,
+                window=cfg.window,
+                dataset_tokens=cfg.future_summary_dataset_tokens if cfg.future_summary_dataset_tokens > 0 else int(train_data.numel()),
+            )
+            gamma_horizons_for_future = gamma_horizons
+            gamma_weights_for_future = gamma_weights
+            if cfg.future_summary_shortest_as_ce:
+                ce_weight, gamma_horizons_for_future, gamma_weights_for_future = _split_shortest_horizon_for_ce(
+                    gamma_horizons,
+                    gamma_weights,
+                )
+            future_summary_loss = _compute_gamma_future_summary_loss(hidden, gamma_horizons_for_future, gamma_weights_for_future)
+        else:
+            future_summary_loss = _compute_future_summary_loss(core_model, hidden, cfg.future_summary_horizons)
+    else:
+        future_summary_loss = ce_loss.new_zeros(())
 
     rollout_ce, semantic_loss = _compute_rollout_losses(
         core_model,
@@ -377,7 +645,7 @@ def _compute_train_loss(
         include_semantic=semantic_active,
     ) if rollout_active else (ce_loss.new_zeros(()), ce_loss.new_zeros(()))
 
-    total_loss = ce_loss + future_lambda * future_summary_loss
+    total_loss = ce_loss * float(ce_weight) + cfg.trajectory_aux_lambda * trajectory_loss + future_lambda * future_summary_loss
     if rollout_active:
         total_loss = total_loss + cfg.rollout_lambda * rollout_ce
     if semantic_active:
@@ -385,6 +653,8 @@ def _compute_train_loss(
     return total_loss, StepLossStats(
         total=float(total_loss.detach().item()),
         ce=float(ce_loss.detach().item()),
+        trajectory=float(trajectory_loss.detach().item()) if trajectory_active else float("nan"),
+        trajectory_lambda=float(cfg.trajectory_aux_lambda) if trajectory_active else float("nan"),
         future=float(future_summary_loss.detach().item()) if future_active else float("nan"),
         future_lambda=float(future_lambda) if future_active else float("nan"),
         rollout=float(rollout_ce.detach().item()) if rollout_active else float("nan"),
@@ -470,9 +740,10 @@ def eval_future_summary_deterministic(
     batch_size: int,
     horizons: tuple[int, ...],
     max_batches: int,
-) -> tuple[float, int]:
-    if not horizons or max_batches <= 0 or window <= min(horizons):
-        return float("nan"), 0
+) -> tuple[float, int, tuple[int, ...], Dict[int, float]]:
+    resolved_horizons = _resolve_fixed_future_horizons(horizons, window=window)
+    if not resolved_horizons or max_batches <= 0:
+        return float("nan"), 0, (), {}
 
     model.eval()
     core_model = _unwrap_model(model)
@@ -486,13 +757,13 @@ def eval_future_summary_deterministic(
     n_tokens = len(data) - 1
     usable_tokens = (n_tokens // window) * window
     if usable_tokens <= 0:
-        return float("nan"), 0
+        return float("nan"), 0, (), {}
 
     x_all = data[:usable_tokens].view(-1, window)
     total_examples = int(x_all.size(0))
     target_examples = min(total_examples, int(batch_size) * int(max_batches))
     if target_examples <= 0:
-        return float("nan"), 0
+        return float("nan"), 0, (), {}
 
     if target_examples == total_examples:
         example_ids = torch.arange(total_examples, device=x_all.device, dtype=torch.long)
@@ -508,18 +779,119 @@ def eval_future_summary_deterministic(
 
     total_future = 0.0
     total_count = 0
+    per_h_total: Dict[int, float] = {}
+    per_h_count: Dict[int, int] = {}
     for start in range(0, x_eval.size(0), batch_size):
         x = x_eval[start: start + batch_size]
         with _autocast_context():
             hidden = core_model.hidden_states(x)
-            future_loss = _compute_future_summary_loss(core_model, hidden, horizons)
+            losses_by_horizon = _compute_future_summary_losses_by_horizon(core_model, hidden, resolved_horizons)
+            if losses_by_horizon:
+                future_loss = torch.stack(list(losses_by_horizon.values()), dim=0).mean()
+            else:
+                future_loss = torch.zeros((), device=hidden.device, dtype=torch.float32)
         count = int(x.size(0))
         total_future += float(future_loss.item()) * count
         total_count += count
+        for horizon, loss in losses_by_horizon.items():
+            h = int(horizon)
+            per_h_total[h] = per_h_total.get(h, 0.0) + float(loss.item()) * count
+            per_h_count[h] = per_h_count.get(h, 0) + count
 
     if total_count <= 0:
-        return float("nan"), 0
-    return total_future / total_count, total_count
+        return float("nan"), 0, (), {}
+
+    per_h_losses = {
+        int(h): (per_h_total[h] / max(per_h_count[h], 1))
+        for h in sorted(per_h_total)
+    }
+    resolved_horizons = tuple(sorted(per_h_losses.keys()))
+    return total_future / total_count, total_count, resolved_horizons, per_h_losses
+
+
+@torch.no_grad()
+def eval_future_summary_gamma_deterministic(
+    model: nn.Module,
+    data: torch.Tensor,
+    window: int,
+    batch_size: int,
+    max_batches: int,
+    dataset_tokens: int | None = None,
+) -> tuple[float, int, tuple[int, ...], Dict[int, float], Dict[int, float]]:
+    if max_batches <= 0 or window <= 1:
+        return float("nan"), 0, (), {}, {}
+
+    model.eval()
+    core_model = _unwrap_model(model)
+    gamma_horizons, gamma_weights = _resolve_gamma_horizons_and_weights(
+        core_model,
+        window=window,
+        dataset_tokens=dataset_tokens if dataset_tokens is not None else int(data.numel()),
+    )
+    if not gamma_horizons:
+        return float("nan"), 0, (), {}, {}
+
+    device_obj = torch.device(DEVICE)
+    if data.device != device_obj:
+        data = data.to(device_obj, non_blocking=True)
+    if not data.is_contiguous():
+        data = data.contiguous()
+
+    n_tokens = len(data) - 1
+    usable_tokens = (n_tokens // window) * window
+    if usable_tokens <= 0:
+        return float("nan"), 0, (), {}, {}
+
+    x_all = data[:usable_tokens].view(-1, window)
+    total_examples = int(x_all.size(0))
+    target_examples = min(total_examples, int(batch_size) * int(max_batches))
+    if target_examples <= 0:
+        return float("nan"), 0, (), {}, {}
+
+    if target_examples == total_examples:
+        example_ids = torch.arange(total_examples, device=x_all.device, dtype=torch.long)
+    else:
+        example_ids = torch.linspace(
+            0,
+            total_examples - 1,
+            steps=target_examples,
+            device=x_all.device,
+            dtype=torch.float32,
+        ).round().to(dtype=torch.long)
+    x_eval = x_all.index_select(0, example_ids)
+
+    total_future = 0.0
+    total_count = 0
+    per_h_total: Dict[int, float] = {}
+    per_h_count: Dict[int, int] = {}
+    for start in range(0, x_eval.size(0), batch_size):
+        x = x_eval[start: start + batch_size]
+        with _autocast_context():
+            hidden = core_model.hidden_states(x)
+            losses_by_horizon = _compute_gamma_future_losses_by_horizon(hidden, gamma_horizons)
+            future_loss = _aggregate_gamma_future_losses(losses_by_horizon, gamma_horizons, gamma_weights, reference=hidden)
+        count = int(x.size(0))
+        total_future += float(future_loss.item()) * count
+        total_count += count
+        for horizon, loss in losses_by_horizon.items():
+            h = int(horizon)
+            per_h_total[h] = per_h_total.get(h, 0.0) + float(loss.item()) * count
+            per_h_count[h] = per_h_count.get(h, 0) + count
+
+    if total_count <= 0:
+        return float("nan"), 0, (), {}, {}
+
+    per_h_losses = {
+        int(h): (per_h_total[h] / max(per_h_count[h], 1))
+        for h in sorted(per_h_total)
+    }
+    resolved_horizons = tuple(sorted(per_h_losses.keys()))
+    weights_by_horizon = {
+        int(h): float(gamma_weights[idx].item())
+        for idx, h in enumerate(gamma_horizons)
+        if idx < int(gamma_weights.numel())
+    }
+    return total_future / total_count, total_count, resolved_horizons, per_h_losses, weights_by_horizon
 
 
 def _collect_grad_stats(model: nn.Module, topk: int = 3) -> Dict[str, object]:
@@ -639,6 +1011,24 @@ def _collect_k_layer_stats(model: nn.Module) -> str:
     alphas = []
     gammas = []
     rhos = []
+    kappas = []
+    epsilons = []
+    stack_gamma = None
+    if hasattr(model.k_stack, "decay_gamma"):
+        stack_gamma = model.k_stack.decay_gamma()
+    if hasattr(model.k_stack, "kappa_proj"):
+        kappa_proj = model.k_stack.kappa_proj
+        bias = getattr(kappa_proj, "bias", None)
+        if isinstance(bias, torch.Tensor):
+            kappa_vec = torch.sigmoid(bias.detach().float())
+            kappas.extend(kappa_vec.tolist())
+    if hasattr(model.k_stack, "epsilon_proj"):
+        epsilon_proj = model.k_stack.epsilon_proj
+        bias = getattr(epsilon_proj, "bias", None)
+        if isinstance(bias, torch.Tensor):
+            epsilon_vec = torch.tanh(bias.detach().float())
+            epsilons.extend(epsilon_vec.tolist())
+
     for layer in model.k_stack.layers:
         if hasattr(layer, "k_base_gate_logit"):
             gates.append(torch.sigmoid(layer.k_base_gate_logit).item())
@@ -647,12 +1037,20 @@ def _collect_k_layer_stats(model: nn.Module) -> str:
             alpha_vec = alpha_cap * torch.sigmoid(layer.alpha_logit)
             alphas.append((alpha_vec.min().item(), alpha_vec.mean().item(), alpha_vec.max().item()))
         if hasattr(layer, "decay_logit"):
-            gamma_min = float(getattr(layer, "gamma_min", 0.0))
-            gamma_max = float(getattr(layer, "gamma_max", 1.0))
-            gamma = gamma_min + (gamma_max - gamma_min) * torch.sigmoid(layer.decay_logit)
+            if hasattr(layer, "decay_gamma"):
+                gamma = layer.decay_gamma()
+            else:
+                gamma_min = float(getattr(layer, "gamma_min", 0.0))
+                gamma_max = float(getattr(layer, "gamma_max", 1.0))
+                gamma = torch.sigmoid(layer.decay_logit).clamp(min=gamma_min, max=gamma_max)
             gammas.append((gamma.min().item(), gamma.mean().item(), gamma.max().item()))
         if hasattr(layer, "rho_logit"):
             rhos.append(torch.sigmoid(layer.rho_logit).item())
+        if hasattr(layer, "kappa_logit"):
+            kappa = torch.sigmoid(layer.kappa_logit).item()
+            kappas.append(kappa)
+    if stack_gamma is not None:
+        gammas.append((stack_gamma.min().item(), stack_gamma.mean().item(), stack_gamma.max().item()))
 
     parts = []
     if gates:
@@ -669,6 +1067,10 @@ def _collect_k_layer_stats(model: nn.Module) -> str:
         parts.append(f"gamma[min/mean/max]={g_min:.3f}/{g_mean:.3f}/{g_max:.3f}")
     if rhos:
         parts.append(f"rho[min/mean/max]={min(rhos):.3f}/{sum(rhos) / len(rhos):.3f}/{max(rhos):.3f}")
+    if kappas:
+        parts.append(f"kappa[min/mean/max]={min(kappas):.3f}/{sum(kappas) / len(kappas):.3f}/{max(kappas):.3f}")
+    if epsilons:
+        parts.append(f"epsilon[min/mean/max]={min(epsilons):.3f}/{sum(epsilons) / len(epsilons):.3f}/{max(epsilons):.3f}")
     return " | ".join(parts)
 
 
@@ -811,6 +1213,12 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
         best_rollout_ce = _metric_from_checkpoint(ckpt_targets.best_rollout, "val_rollout_ce")
         best_useful_rollout_ce = _metric_from_checkpoint(ckpt_targets.best_useful, "val_rollout_ce")
 
+    # Some legacy checkpoints (or optimizer-only mismatch fallbacks) do not carry
+    # per-group `initial_lr`, but LambdaLR requires it when last_epoch >= 0.
+    if start_step > 0:
+        for group in optimizer.param_groups:
+            group.setdefault("initial_lr", group.get("lr", cfg.lr))
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lr_lambda=lr_lambda,
@@ -838,6 +1246,19 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
         n_params = sum(p.numel() for p in g["params"])
         group_parts.append(f"{g.get('name', 'group')}[n={n_params},lr={g['lr']:.2e},wd={g['weight_decay']:.2e}]")
     LOG.info("Optimizer groups | %s", " | ".join(group_parts))
+    core_model = _unwrap_model(model)
+    trajectory_enabled = cfg.trajectory_aux_lambda > 0.0 and getattr(core_model, "trajectory_aux_head", None) is not None
+    if cfg.trajectory_aux_lambda > 0.0 and not trajectory_enabled:
+        LOG.warning(
+            "trajectory_aux_lambda=%.4f requested but trajectory auxiliary head is unavailable; ignoring auxiliary trajectory loss.",
+            cfg.trajectory_aux_lambda,
+        )
+    elif trajectory_enabled:
+        LOG.info(
+            "Trajectory aux | lambda=%.4f | primary_head=%s | aux_head=trajectory",
+            cfg.trajectory_aux_lambda,
+            str(getattr(core_model, "head_mode", "unknown")),
+        )
     if cfg.rollout_horizon > 0 and cfg.rollout_lambda > 0.0:
         LOG.info(
             "Aux objective | horizon=%d | rollout_lambda=%.3f | rollout_start=%d | rollout_mode=%s | semantic_lambda=%.3f | semantic_start=%d",
@@ -848,11 +1269,46 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
             cfg.semantic_lambda,
             cfg.semantic_start_step,
         )
-    future_horizons_str = ",".join(str(h) for h in cfg.future_summary_horizons) if cfg.future_summary_horizons else ""
-    if cfg.future_summary_horizons and cfg.future_summary_lambda > 0.0:
+    future_enabled = bool(cfg.future_summary_gamma_horizons or cfg.future_summary_horizons) and cfg.future_summary_lambda > 0.0
+    future_eval_horizons: tuple[int, ...] = (
+        _resolve_fixed_future_horizons(cfg.future_summary_horizons, window=cfg.window)
+        if not cfg.future_summary_gamma_horizons
+        else ()
+    )
+    future_eval_weights: Dict[int, float] = {}
+    if future_enabled:
+        future_mode = "gamma_decay" if cfg.future_summary_gamma_horizons else "fixed"
+        ce_mode = "shortest_horizon_weighted_ce" if cfg.future_summary_shortest_as_ce else "base_ce_plus_future"
+        if cfg.future_summary_shortest_as_ce and not cfg.future_summary_gamma_horizons:
+            LOG.warning(
+                "future_summary_shortest_as_ce is currently applied only in gamma horizon mode; fixed-horizon mode keeps base CE unchanged."
+            )
+        if cfg.future_summary_gamma_horizons:
+            gamma_horizons, gamma_weights = _resolve_gamma_horizons_and_weights(
+                core_model,
+                window=cfg.window,
+                dataset_tokens=cfg.future_summary_dataset_tokens if cfg.future_summary_dataset_tokens > 0 else int(train_data.numel()),
+            )
+            future_eval_horizons = gamma_horizons
+            future_eval_weights = {
+                int(h): float(gamma_weights[idx].item())
+                for idx, h in enumerate(gamma_horizons)
+                if idx < int(gamma_weights.numel())
+            }
+            if gamma_horizons:
+                LOG.info(
+                    "Future gamma horizons | source=shared_k_stack_decay | dataset_tokens=%d | horizon_count=%d | horizons=%s | norm_inv_tau_weights(1-gamma)=%s",
+                    cfg.future_summary_dataset_tokens if cfg.future_summary_dataset_tokens > 0 else int(train_data.numel()),
+                    len(gamma_horizons),
+                    _format_horizon_list(gamma_horizons),
+                    _format_horizon_values(future_eval_weights, precision=3),
+                )
         LOG.info(
-            "Future summary | horizons=%s | future_lambda_max=%.3f | future_lambda_min=%.3f | future_start=%d",
-            future_horizons_str,
+            "Future summary | mode=%s | ce_mode=%s | horizon_count=%d | horizons=%s | future_lambda_max=%.3f | future_lambda_min=%.3f | future_start=%d",
+            future_mode,
+            ce_mode,
+            len(future_eval_horizons),
+            _format_horizon_list(future_eval_horizons),
             cfg.future_summary_lambda,
             cfg.future_summary_lambda_min,
             cfg.future_summary_start_step,
@@ -870,12 +1326,22 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
             cfg.rollout_horizon,
             cfg.rollout_eval_batches,
         )
-    if cfg.future_summary_horizons and cfg.future_summary_eval_batches > 0:
-        LOG.info(
-            "Future eval | horizons=%s | batches=%d",
-            future_horizons_str,
-            cfg.future_summary_eval_batches,
-        )
+    if future_enabled and cfg.future_summary_eval_batches > 0:
+        if cfg.future_summary_gamma_horizons:
+            LOG.info(
+                "Future eval | horizon_count=%d | horizons=%s | weights=%s | batches=%d",
+                len(future_eval_horizons),
+                _format_horizon_list(future_eval_horizons),
+                _format_horizon_values(future_eval_weights, precision=3),
+                cfg.future_summary_eval_batches,
+            )
+        else:
+            LOG.info(
+                "Future eval | horizon_count=%d | horizons=%s | batches=%d",
+                len(future_eval_horizons),
+                _format_horizon_list(future_eval_horizons),
+                cfg.future_summary_eval_batches,
+            )
 
     step_times: List[float] = []
     compile_warmup_pending = model is not _unwrap_model(model)
@@ -893,6 +1359,8 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
         t0 = time.time()
         train_total = float("nan")
         train_ce = float("nan")
+        train_trajectory = float("nan")
+        train_trajectory_lambda = float("nan")
         train_future = float("nan")
         train_future_lambda = float("nan")
         train_rollout = float("nan")
@@ -941,6 +1409,8 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                 scheduler.step()
                 train_total = loss_stats.total
                 train_ce = loss_stats.ce
+                train_trajectory = loss_stats.trajectory
+                train_trajectory_lambda = loss_stats.trajectory_lambda
                 train_future = loss_stats.future
                 train_future_lambda = loss_stats.future_lambda
                 train_rollout = loss_stats.rollout
@@ -968,17 +1438,50 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
         if step % cfg.eval_interval == 0:
             ce, ppl = eval_deterministic(model, val_data, cfg.window, cfg.batch_size)
             best_val_ce = min(best_val_ce, ce)
-            val_future_summary = float("nan")
-            val_future_examples = 0
-            if cfg.future_summary_horizons and cfg.future_summary_eval_batches > 0:
-                val_future_summary, val_future_examples = eval_future_summary_deterministic(
+            val_trajectory_ce = float("nan")
+            val_trajectory_tokens = 0
+            if trajectory_enabled:
+                val_trajectory_ce, val_trajectory_tokens = eval_trajectory_deterministic(
                     model,
                     val_data,
                     cfg.window,
                     cfg.batch_size,
-                    cfg.future_summary_horizons,
-                    cfg.future_summary_eval_batches,
                 )
+            val_future_summary = float("nan")
+            val_future_examples = 0
+            val_future_horizons: tuple[int, ...] = ()
+            val_future_losses: Dict[int, float] = {}
+            val_future_weights: Dict[int, float] = {}
+            if (cfg.future_summary_gamma_horizons or cfg.future_summary_horizons) and cfg.future_summary_eval_batches > 0:
+                if cfg.future_summary_gamma_horizons:
+                    (
+                        val_future_summary,
+                        val_future_examples,
+                        val_future_horizons,
+                        val_future_losses,
+                        val_future_weights,
+                    ) = eval_future_summary_gamma_deterministic(
+                        model,
+                        val_data,
+                        cfg.window,
+                        cfg.batch_size,
+                        cfg.future_summary_eval_batches,
+                        dataset_tokens=cfg.future_summary_dataset_tokens if cfg.future_summary_dataset_tokens > 0 else int(train_data.numel()),
+                    )
+                else:
+                    (
+                        val_future_summary,
+                        val_future_examples,
+                        val_future_horizons,
+                        val_future_losses,
+                    ) = eval_future_summary_deterministic(
+                        model,
+                        val_data,
+                        cfg.window,
+                        cfg.batch_size,
+                        cfg.future_summary_horizons,
+                        cfg.future_summary_eval_batches,
+                    )
             val_rollout_ce = float("nan")
             val_semantic = float("nan")
             val_rollout_examples = 0
@@ -1013,6 +1516,7 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                             "selection_metric": "best_ppl",
                             "val_ce": ce,
                             "val_ppl": ppl,
+                            "val_trajectory_ce": val_trajectory_ce,
                             "val_future_summary": val_future_summary,
                             "val_rollout_ce": val_rollout_ce,
                             "val_semantic": val_semantic,
@@ -1030,6 +1534,7 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                         "selection_metric": "best_rollout",
                         "val_ce": ce,
                         "val_ppl": ppl,
+                        "val_trajectory_ce": val_trajectory_ce,
                         "val_future_summary": val_future_summary,
                         "val_rollout_ce": val_rollout_ce,
                         "val_semantic": val_semantic,
@@ -1048,6 +1553,7 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                         "selection_metric": "best_useful",
                         "val_ce": ce,
                         "val_ppl": ppl,
+                        "val_trajectory_ce": val_trajectory_ce,
                         "val_future_summary": val_future_summary,
                         "val_rollout_ce": val_rollout_ce,
                         "val_semantic": val_semantic,
@@ -1066,7 +1572,9 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                 tok_s_str = "N/A"
             lr_now = optimizer.param_groups[0]["lr"]
             aux_enabled = (
-                (bool(cfg.future_summary_horizons) and cfg.future_summary_lambda > 0.0)
+                trajectory_enabled
+                or
+                (bool(cfg.future_summary_gamma_horizons or cfg.future_summary_horizons) and cfg.future_summary_lambda > 0.0)
                 or (cfg.rollout_horizon > 0 and (cfg.rollout_lambda > 0.0 or cfg.semantic_lambda > 0.0))
             )
             if cfg.report_bpc and not aux_enabled:
@@ -1088,17 +1596,21 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                 train_total_str = "N/A" if math.isnan(train_total) else f"{train_total:.4f}"
                 train_bpc_str = "N/A" if math.isnan(train_ce) else f"{ce_to_bpc(train_ce):.4f}"
                 train_ema_str = "N/A" if train_loss_ema is None else f"{ce_to_bpc(train_loss_ema):.4f}"
+                trajectory_str = "N/A" if math.isnan(train_trajectory) else f"{train_trajectory:.4f}"
+                trajectory_lambda_str = "N/A" if math.isnan(train_trajectory_lambda) else f"{train_trajectory_lambda:.4f}"
                 future_str = "N/A" if math.isnan(train_future) else f"{train_future:.4f}"
                 future_lambda_str = "N/A" if math.isnan(train_future_lambda) else f"{train_future_lambda:.4f}"
                 rollout_str = "N/A" if math.isnan(train_rollout) else f"{train_rollout:.4f}"
                 semantic_str = "N/A" if math.isnan(train_semantic) else f"{train_semantic:.4f}"
                 LOG.info(
-                    "step=%5d | phase=%s | train_total=%s | train_bpc=%s | train_bpc_ema=%s | train_future=%s | future_lambda=%s | train_rollout=%s | train_sem=%s | val_bpc=%.4f | val_ppl=%.2f | best_ppl=%.2f | lr=%.2e | %s ms/step | %s tok/s",
+                    "step=%5d | phase=%s | train_total=%s | train_bpc=%s | train_bpc_ema=%s | train_traj=%s | traj_lambda=%s | train_future=%s | future_lambda=%s | train_rollout=%s | train_sem=%s | val_bpc=%.4f | val_ppl=%.2f | best_ppl=%.2f | lr=%.2e | %s ms/step | %s tok/s",
                     step,
                     loss_phase,
                     train_total_str,
                     train_bpc_str,
                     train_ema_str,
+                    trajectory_str,
+                    trajectory_lambda_str,
                     future_str,
                     future_lambda_str,
                     rollout_str,
@@ -1129,17 +1641,21 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                 train_total_str = "N/A" if math.isnan(train_total) else f"{train_total:.4f}"
                 train_ce_str = "N/A" if math.isnan(train_ce) else f"{train_ce:.4f}"
                 train_ema_str = "N/A" if train_loss_ema is None else f"{train_loss_ema:.4f}"
+                trajectory_str = "N/A" if math.isnan(train_trajectory) else f"{train_trajectory:.4f}"
+                trajectory_lambda_str = "N/A" if math.isnan(train_trajectory_lambda) else f"{train_trajectory_lambda:.4f}"
                 future_str = "N/A" if math.isnan(train_future) else f"{train_future:.4f}"
                 future_lambda_str = "N/A" if math.isnan(train_future_lambda) else f"{train_future_lambda:.4f}"
                 rollout_str = "N/A" if math.isnan(train_rollout) else f"{train_rollout:.4f}"
                 semantic_str = "N/A" if math.isnan(train_semantic) else f"{train_semantic:.4f}"
                 LOG.info(
-                    "step=%5d | phase=%s | train_total=%s | train_ce=%s | train_ce_ema=%s | train_future=%s | future_lambda=%s | train_rollout=%s | train_sem=%s | val_ce=%.4f | val_ppl=%.2f | best_ppl=%.2f | lr=%.2e | %s ms/step | %s tok/s",
+                    "step=%5d | phase=%s | train_total=%s | train_ce=%s | train_ce_ema=%s | train_traj=%s | traj_lambda=%s | train_future=%s | future_lambda=%s | train_rollout=%s | train_sem=%s | val_ce=%.4f | val_ppl=%.2f | best_ppl=%.2f | lr=%.2e | %s ms/step | %s tok/s",
                     step,
                     loss_phase,
                     train_total_str,
                     train_ce_str,
                     train_ema_str,
+                    trajectory_str,
+                    trajectory_lambda_str,
                     future_str,
                     future_lambda_str,
                     rollout_str,
@@ -1151,14 +1667,38 @@ def train_model(model: KStackModel, train_data: torch.Tensor, val_data: torch.Te
                     avg_ms_str,
                     tok_s_str,
                 )
-            if val_future_examples > 0:
+            if val_trajectory_tokens > 0:
                 LOG.info(
-                    "future_eval | step=%5d | val_future=%.4f | examples=%d | horizons=%s",
+                    "trajectory_eval | step=%5d | val_traj_ce=%.4f | tokens=%d",
                     step,
-                    val_future_summary,
-                    val_future_examples,
-                    future_horizons_str,
+                    val_trajectory_ce,
+                    val_trajectory_tokens,
                 )
+            if val_future_examples > 0:
+                if cfg.future_summary_gamma_horizons:
+                    LOG.info(
+                        "future_eval | step=%5d | val_future=%.4f | examples=%d | horizon_count=%d | horizons=%s | per_h_loss=%s | weights=%s",
+                        step,
+                        val_future_summary,
+                        val_future_examples,
+                        len(val_future_horizons),
+                        _format_horizon_list(val_future_horizons),
+                        _format_horizon_values(val_future_losses, precision=4),
+                        _format_horizon_values(
+                            {h: val_future_weights[h] for h in val_future_horizons if h in val_future_weights},
+                            precision=3,
+                        ),
+                    )
+                else:
+                    LOG.info(
+                        "future_eval | step=%5d | val_future=%.4f | examples=%d | horizon_count=%d | horizons=%s | per_h_loss=%s",
+                        step,
+                        val_future_summary,
+                        val_future_examples,
+                        len(val_future_horizons),
+                        _format_horizon_list(val_future_horizons),
+                        _format_horizon_values(val_future_losses, precision=4),
+                    )
             if val_rollout_examples > 0:
                 LOG.info(
                     "rollout_eval | step=%5d | val_rollout_ce=%.4f | val_sem=%.4f | examples=%d | mode=argmax",

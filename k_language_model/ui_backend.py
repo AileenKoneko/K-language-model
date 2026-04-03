@@ -739,6 +739,16 @@ def _ingest_job_output_message(job: JobRecord, level: str, message: str) -> None
         _append_event(job, message)
         return
 
+    if message.startswith("Sample stream |"):
+        job.phase = "sampling"
+        _update_dict_strings(
+            job.summary_stats,
+            _parse_pipe_key_values(message),
+            allowed={"interval_tokens", "tty"},
+        )
+        _append_event(job, message)
+        return
+
     if message.startswith("Training complete |"):
         job.phase = "completed"
         match = _PLAIN_KEY_VALUE_RE.search(message.replace("Training complete | ", ""))

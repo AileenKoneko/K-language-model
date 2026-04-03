@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+from collections.abc import Callable
 
 from .tokenizers import TextTokenizer
 from .runtime import DEVICE, _unwrap_model
@@ -19,6 +20,8 @@ def sample_text(
     repetition_penalty: float = 1.0,
     repetition_window: int = 256,
     prompt_lock_tokens: int = 0,
+    on_stream: Callable[[int, str, str], None] | None = None,
+    stream_interval_tokens: int = 1,
 ) -> str:
     model.eval()
     core_model = _unwrap_model(model)
@@ -27,6 +30,9 @@ def sample_text(
         context = [0]
 
     x = torch.tensor(context, dtype=torch.long, device=DEVICE).unsqueeze(0)
+    stream_interval = max(int(stream_interval_tokens), 1)
+    stream_prev_text = tokenizer.decode(x[0].tolist()) if on_stream is not None else ""
+    stream_last_full_text = stream_prev_text
     for _ in range(max_new_tokens):
         if prompt_lock_tokens > 0 and x.size(1) > window:
             lock_len = min(int(prompt_lock_tokens), max(window - 1, 0), x.size(1))
@@ -76,5 +82,19 @@ def sample_text(
             )
         next_id = torch.multinomial(probs, num_samples=1)
         x = torch.cat([x, next_id], dim=1)
+        generated_tokens = x.size(1) - len(context)
+        should_emit = generated_tokens > 0 and (
+            (generated_tokens % stream_interval == 0) or (generated_tokens == max_new_tokens)
+        )
+        if on_stream is not None and should_emit:
+            stream_last_full_text = tokenizer.decode(x[0].tolist())
+            if stream_last_full_text.startswith(stream_prev_text):
+                stream_delta_text = stream_last_full_text[len(stream_prev_text):]
+            else:
+                stream_delta_text = stream_last_full_text
+            on_stream(generated_tokens, stream_delta_text, stream_last_full_text)
+            stream_prev_text = stream_last_full_text
 
+    if on_stream is not None:
+        return stream_last_full_text
     return tokenizer.decode(x[0].tolist())

@@ -30,6 +30,7 @@ _VALID_INT_DTYPES = {
 
 _ROSA_CPP_DISABLE_ENV = "KLM_DISABLE_ROSA_CPP"
 _ROSA_CPP_MODULE_NAME = "k_language_model_rosa_cpp"
+_ROSA_NGRAM_CACHE_MAX_BIGRAM_VOCAB = 256
 
 
 def _validate_integer_tensor(token_ids: torch.Tensor, *, expected_ndim: int) -> None:
@@ -322,16 +323,93 @@ def _rosa_next_token_ids_batch_gpu_approx(token_ids: torch.Tensor) -> torch.Tens
     return predictions
 
 
+def _rosa_next_token_ids_batch_ngram_cache(token_ids: torch.Tensor) -> torch.Tensor:
+    """Behavior-oriented ROSA proxy using online unigram/bigram continuation caches.
+
+    This path keeps ROSA's key behavior (emit likely continuation token for repeated
+    contexts) while avoiding suffix-automaton construction.
+    """
+
+    _validate_token_id_batch(token_ids)
+
+    batch, window = token_ids.shape
+    if window == 0:
+        return torch.empty((batch, 0), dtype=torch.int64, device=token_ids.device)
+
+    token_ids_i64 = token_ids.to(dtype=torch.int64)
+    vocab = int(token_ids_i64.max().item()) + 1
+    predictions = torch.full((batch, window), -1, dtype=torch.int64, device=token_ids.device)
+    if vocab <= 0:
+        return predictions
+
+    unigram_follow = torch.full((batch, vocab), -1, dtype=torch.int64, device=token_ids.device)
+    use_bigram = vocab <= _ROSA_NGRAM_CACHE_MAX_BIGRAM_VOCAB
+    if use_bigram:
+        bigram_follow = torch.full((batch, vocab * vocab), -1, dtype=torch.int64, device=token_ids.device)
+
+    for i in range(window):
+        token = token_ids_i64[:, i]
+        pred_unigram = unigram_follow.gather(1, token.view(batch, 1)).squeeze(1)
+
+        if use_bigram and i > 0:
+            prev = token_ids_i64[:, i - 1]
+            pair_key = prev * vocab + token
+            pred_bigram = bigram_follow.gather(1, pair_key.view(batch, 1)).squeeze(1)
+            predictions[:, i] = torch.where(pred_bigram >= 0, pred_bigram, pred_unigram)
+        else:
+            predictions[:, i] = pred_unigram
+
+        if i + 1 < window:
+            nxt = token_ids_i64[:, i + 1]
+            unigram_follow.scatter_(1, token.view(batch, 1), nxt.view(batch, 1))
+            if use_bigram and i > 0:
+                bigram_follow.scatter_(1, pair_key.view(batch, 1), nxt.view(batch, 1))
+
+    return predictions
+
+
+def _rosa_next_token_ids_batch_copy_prior(token_ids: torch.Tensor) -> torch.Tensor:
+    """Cheap history-copy prior: predict continuation from last seen token match.
+
+    Compared to suffix automata, this intentionally keeps only a lightweight signal:
+    for token `x[i]`, emit the token that followed the most recent prior occurrence
+    of `x[i]` in the same sequence, else `-1`.
+    """
+
+    _validate_token_id_batch(token_ids)
+
+    token_ids_i64 = token_ids.to(dtype=torch.int64)
+    batch, window = token_ids_i64.shape
+    if window == 0:
+        return torch.empty((batch, 0), dtype=torch.int64, device=token_ids.device)
+
+    vocab = int(token_ids_i64.max().item()) + 1
+    predictions = torch.full((batch, window), -1, dtype=torch.int64, device=token_ids.device)
+    if vocab <= 0:
+        return predictions
+
+    seen_next = torch.full((batch, vocab), -1, dtype=torch.int64, device=token_ids.device)
+    for i in range(window):
+        token = token_ids_i64[:, i]
+        predictions[:, i] = seen_next.gather(1, token.view(batch, 1)).squeeze(1)
+        if i + 1 < window:
+            nxt = token_ids_i64[:, i + 1]
+            seen_next.scatter_(1, token.view(batch, 1), nxt.view(batch, 1))
+    return predictions
+
+
 def rosa_next_token_ids_batch(token_ids: torch.Tensor, impl: str = "exact") -> torch.Tensor:
     """Batched ROSA for [B, W] integer token tensors.
 
     `impl`:
     - `exact`: bit-identical to reference CPU implementation (may move tensors to CPU).
     - `gpu_approx`: GPU-native tensorized approximation.
+    - `ngram_cache`: online unigram/bigram continuation cache proxy.
+    - `copy_prior`: cheap history-copy continuation proxy.
     - `auto`: use `gpu_approx` on accelerators, else `exact`.
     """
 
-    if impl not in {"exact", "gpu_approx", "auto"}:
+    if impl not in {"exact", "gpu_approx", "ngram_cache", "copy_prior", "auto"}:
         raise ValueError(f"Unknown ROSA batch impl: {impl}")
     _validate_token_id_batch(token_ids)
 
@@ -340,6 +418,10 @@ def rosa_next_token_ids_batch(token_ids: torch.Tensor, impl: str = "exact") -> t
 
     if impl == "gpu_approx":
         return _rosa_next_token_ids_batch_gpu_approx(token_ids)
+    if impl == "ngram_cache":
+        return _rosa_next_token_ids_batch_ngram_cache(token_ids)
+    if impl == "copy_prior":
+        return _rosa_next_token_ids_batch_copy_prior(token_ids)
 
     return _rosa_next_token_ids_batch_exact(token_ids)
 

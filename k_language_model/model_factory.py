@@ -6,6 +6,8 @@ from .configs import ModelConfig
 from .kstack import KStackModel
 from .runtime import LOG
 
+_GAMMA_HORIZON_TOKENS = {"gamma", "auto-gamma", "learned-gamma", "decay-gamma"}
+
 
 def parse_adaptive_cutoffs(raw: str | None) -> list[int] | None:
     if raw is None:
@@ -23,10 +25,20 @@ def parse_int_list(raw: str | None) -> tuple[int, ...]:
         stripped = part.strip()
         if not stripped:
             continue
-        value = int(stripped)
+        try:
+            value = int(stripped)
+        except ValueError:
+            continue
         if value > 0:
             values.append(value)
     return tuple(sorted(set(values)))
+
+
+def uses_gamma_horizons(raw: str | None) -> bool:
+    if raw is None:
+        return False
+    tokens = [part.strip().lower() for part in raw.split(",") if part.strip()]
+    return any(token in _GAMMA_HORIZON_TOKENS for token in tokens)
 
 
 def build_model(config: ModelConfig) -> KStackModel:
@@ -55,6 +67,7 @@ def build_model(config: ModelConfig) -> KStackModel:
         gamma_min=config.gamma_min,
         gamma_max=config.gamma_max,
         decay_impl=config.decay_impl,
+        trajectory_aux=config.trajectory_aux,
         rosa_impl=config.rosa_impl,
         rosa_layers=config.rosa_layers,
         k_base_kernel_size=config.k_base_kernel_size,
@@ -70,11 +83,16 @@ def model_config_from_args(
     mlp_dropout: float,
     residual_dropout: float,
 ) -> ModelConfig:
-    future_summary_horizons = parse_int_list(getattr(args, "future_summary_horizons", None))
+    future_horizons_raw = getattr(args, "future_summary_horizons", None)
+    future_summary_horizons = ()
+    window = int(getattr(args, "window"))
+    if not uses_gamma_horizons(future_horizons_raw):
+        future_summary_horizons = parse_int_list(future_horizons_raw)
     if not future_summary_horizons:
         single_horizon = int(getattr(args, "future_summary_horizon", 0) or 0)
         if single_horizon > 0:
             future_summary_horizons = (single_horizon,)
+    future_summary_horizons = tuple(sorted({int(h) for h in future_summary_horizons if 1 < int(h) < window}))
     return ModelConfig(
         future_summary_horizons=future_summary_horizons,
         vocab_size=vocab_size,
@@ -98,6 +116,7 @@ def model_config_from_args(
         gamma_min=args.gamma_min,
         gamma_max=args.gamma_max,
         decay_impl=args.decay_impl,
+        trajectory_aux=bool(getattr(args, "trajectory_aux", False)),
         rosa_impl=args.rosa_impl,
         rosa_layers=args.rosa_layers,
         k_base_kernel_size=args.k_base_kernel_size,

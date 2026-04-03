@@ -10,7 +10,7 @@ def _record_rosa_routes(model: KStackModel, rosa_h: torch.Tensor) -> list[tuple[
     k2_layers = [layer for layer in model.k_stack.layers if isinstance(layer, K2Layer)]
 
     for idx, layer in enumerate(k2_layers):
-        def _forward(self, h, shared_k_base=None, rosa_h=None, *, _idx=idx):
+        def _forward(self, h, shared_k_base=None, shared_decay_basis=None, rosa_h=None, *, _idx=idx):
             seen.append((_idx, rosa_h is not None))
             return h
 
@@ -71,3 +71,57 @@ def test_kstack_model_can_limit_rosa_to_final_k2_layer() -> None:
 
     assert model.describe_rosa_layers() == "final"
     assert routes == [(0, False), (1, False), (2, True)]
+
+
+def test_kstack_model_supports_ngram_cache_rosa_backend() -> None:
+    model = KStackModel(
+        vocab_size=48,
+        window=8,
+        d=6,
+        emb_dim=4,
+        rank=3,
+        n_k2=2,
+        emb_dropout=0.0,
+        mlp_dropout=0.0,
+        residual_dropout=0.0,
+        decay_impl="mask",
+        rosa_impl="ngram_cache",
+        rosa_layers="all",
+    )
+    token_ids = torch.tensor(
+        [
+            [1, 2, 1, 2, 3, 1, 2, 4],
+            [5, 5, 5, 5, 1, 5, 1, 5],
+        ],
+        dtype=torch.int64,
+    )
+
+    logits = model(token_ids)
+    assert logits.shape == (2, 8, 48)
+
+
+def test_kstack_model_supports_copy_prior_rosa_backend() -> None:
+    model = KStackModel(
+        vocab_size=48,
+        window=8,
+        d=6,
+        emb_dim=4,
+        rank=3,
+        n_k2=2,
+        emb_dropout=0.0,
+        mlp_dropout=0.0,
+        residual_dropout=0.0,
+        decay_impl="mask",
+        rosa_impl="copy_prior",
+        rosa_layers="all",
+    )
+    token_ids = torch.tensor(
+        [
+            [1, 2, 1, 2, 3, 1, 2, 4],
+            [5, 5, 5, 5, 1, 5, 1, 5],
+        ],
+        dtype=torch.int64,
+    )
+
+    logits = model(token_ids)
+    assert logits.shape == (2, 8, 48)

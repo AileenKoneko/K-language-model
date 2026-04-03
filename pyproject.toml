@@ -29,6 +29,7 @@ k-lm-bench-denoise = "k_language_model.denoise_bench:main"
 k-lm-sequence-predict = "k_language_model.sequence_prediction:main"
 k-lm-sequence-stats = "k_language_model.sequence_prediction_stats:main"
 k-lm-ui = "k_language_model.ui_app:main"
+k-lm-state-rank-probe = "k_language_model.state_rank_probe:main"
 
 [tool.setuptools]
 packages = ["k_language_model"]

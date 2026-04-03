@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Dict, List
 
 import torch
@@ -40,9 +39,13 @@ class K2Layer(nn.Module):
         gamma_max: float = 1.0,
         decay_impl: str = "mask",
         k_base_kernel_size: int = DEFAULT_K_BASE_KERNEL_SIZE,
+        use_shared_decay: bool = False,
     ):
         super().__init__()
         self.window = int(window)
+        self.rank = int(rank)
+        if self.rank <= 0:
+            raise ValueError(f"Expected rank > 0, got {self.rank}.")
         self.alpha_cap = float(alpha_cap)
         self.gamma_min = float(gamma_min)
         self.gamma_max = float(gamma_max)
@@ -54,26 +57,24 @@ class K2Layer(nn.Module):
         self.k_base_impl = resolve_kbase_impl_name(k_base_impl)
         self.k_base_kernel_size = max(int(k_base_kernel_size), 1)
         self.use_shared_k_base = bool(use_shared_k_base)
+        self.use_shared_decay = bool(use_shared_decay)
         self.decay_impl = str(decay_impl).strip().lower()
         self.k_base_backend = build_kbase_impl(self.k_base_impl)
-        self.decay_backend = build_decay_impl(self.decay_impl)
+        if self.use_shared_decay:
+            self.decay_backend = None
+            self._causal_mask_smoke_checked = True
+        else:
+            self.decay_backend = build_decay_impl(self.decay_impl)
+            self.decay_logit = nn.Parameter(torch.zeros(self.rank))
 
-        tau_low = 1.0 / max(1.0 - self.gamma_min, 1e-6)
-        tau_high = 1.0 / max(1.0 - min(self.gamma_max, 1.0 - 1e-6), 1e-6)
-        taus = torch.logspace(math.log10(tau_low), math.log10(tau_high), rank)
-        gammas = 1.0 - 1.0 / taus
-        p = (gammas - self.gamma_min) / (self.gamma_max - self.gamma_min)
-        p = p.clamp(min=1e-6, max=1.0 - 1e-6)
-        self.decay_logit = nn.Parameter(torch.log(p / (1.0 - p)))
-
-        pos = torch.arange(self.window, dtype=torch.float32)
-        self.register_buffer("causal_mask", torch.tril(torch.ones(self.window, self.window)), persistent=False)
-        self.register_buffer(
-            "decay_diff",
-            (pos.unsqueeze(1) - pos.unsqueeze(0)).clamp(min=0).contiguous(),
-            persistent=False,
-        )
-        self._causal_mask_smoke_checked = False
+            pos = torch.arange(self.window, dtype=torch.float32)
+            self.register_buffer("causal_mask", torch.tril(torch.ones(self.window, self.window)), persistent=False)
+            self.register_buffer(
+                "decay_diff",
+                (pos.unsqueeze(1) - pos.unsqueeze(0)).clamp(min=0).contiguous(),
+                persistent=False,
+            )
+            self._causal_mask_smoke_checked = False
 
         self.k_base_gate_logit = nn.Parameter(torch.tensor(0.0))
         if self.use_shared_k_base:
@@ -81,9 +82,10 @@ class K2Layer(nn.Module):
         else:
             self.k_base_kernel = self.k_base_backend.default_parameter(self.k_base_kernel_size)
 
-        self.u = nn.Parameter(torch.randn(d, rank) * 0.05)
-        self.v = nn.Parameter(torch.randn(d, rank) * 0.05)
-        self.alpha_logit = nn.Parameter(torch.zeros(rank))
+        if not self.use_shared_decay:
+            self.u = nn.Parameter(torch.randn(d, self.rank) * 0.05)
+            self.v = nn.Parameter(torch.randn(d, self.rank) * 0.05)
+        self.alpha_logit = nn.Parameter(torch.zeros(self.rank))
         self.rho_logit = nn.Parameter(torch.tensor(-2.1972246))
 
         self.proj = nn.Linear(d, d)
@@ -103,16 +105,25 @@ class K2Layer(nn.Module):
             kernel = self.k_base_kernel
         return kernel.to(dtype=dtype, device=device)
 
+    def decay_gamma(self, *, dtype: torch.dtype | None = None, device: torch.device | None = None) -> torch.Tensor:
+        if not hasattr(self, "decay_logit"):
+            raise RuntimeError("decay_gamma is unavailable when use_shared_decay=True.")
+        gamma = torch.sigmoid(self.decay_logit).clamp(min=self.gamma_min, max=self.gamma_max)
+        if dtype is not None or device is not None:
+            gamma = gamma.to(dtype=dtype if dtype is not None else gamma.dtype, device=device if device is not None else gamma.device)
+        return gamma
+
     def forward(
         self,
         h: torch.Tensor,
         shared_k_base: torch.Tensor | None = None,
+        shared_decay_basis: torch.Tensor | None = None,
         rosa_h: torch.Tensor | None = None,
     ) -> torch.Tensor:
         _, window, _ = h.shape
         if window > self.window:
             raise ValueError(f"Expected window <= {self.window}, got {window}")
-        if (not self._causal_mask_smoke_checked) and (not is_torch_compiling()):
+        if (not self.use_shared_decay) and (not self._causal_mask_smoke_checked) and (not is_torch_compiling()):
             mask = self.causal_mask
             if mask.ndim != 2 or mask.size(0) != self.window or mask.size(1) != self.window:
                 raise RuntimeError(
@@ -129,22 +140,38 @@ class K2Layer(nn.Module):
         k_base_kernel = self._resolve_k_base_kernel(shared_k_base, dtype=h.dtype, device=h.device)
         out = gate_strength * self.k_base_backend.compute(h_norm, k_base_kernel)
 
-        qk = h_norm @ torch.cat((self.u, self.v), dim=1)
-        q_raw, k_raw = qk.split(self.u.size(1), dim=-1)
-        q = F.normalize(q_raw, dim=-1, eps=1e-8)
-        k = F.normalize(k_raw, dim=-1, eps=1e-8)
-
-        raw = torch.sigmoid(self.decay_logit)
-        gamma_vec = (self.gamma_min + (self.gamma_max - self.gamma_min) * raw).to(dtype=h.dtype, device=h.device)
         alpha = (self.alpha_cap * torch.sigmoid(self.alpha_logit)).to(dtype=h.dtype, device=h.device)
-        q_alpha = q * alpha.view(1, 1, -1)
-        decay_out = self.decay_backend.compute(
-            q_alpha=q_alpha,
-            k=k,
-            h_norm=h_norm,
-            gamma_vec=gamma_vec,
-            buffers=DecayBuffers(causal_mask=self.causal_mask, decay_diff=self.decay_diff),
-        )
+        if self.use_shared_decay:
+            if shared_decay_basis is None:
+                raise RuntimeError("shared_decay_basis is required when use_shared_decay=True.")
+            if (
+                shared_decay_basis.ndim != 4
+                or shared_decay_basis.size(0) != h.size(0)
+                or shared_decay_basis.size(1) != h.size(1)
+                or shared_decay_basis.size(2) != alpha.numel()
+                or shared_decay_basis.size(3) != h.size(2)
+            ):
+                raise RuntimeError(
+                    "shared_decay_basis shape mismatch: "
+                    f"expected {(h.size(0), h.size(1), int(alpha.numel()), h.size(2))}, "
+                    f"got {tuple(shared_decay_basis.shape)}"
+                )
+            decay_basis = shared_decay_basis.to(dtype=h.dtype, device=h.device)
+            decay_out = (decay_basis * alpha.view(1, 1, -1, 1)).sum(dim=2)
+        else:
+            qk = h_norm @ torch.cat((self.u, self.v), dim=1)
+            q_raw, k_raw = qk.split(self.u.size(1), dim=-1)
+            q = F.normalize(q_raw, dim=-1, eps=1e-8)
+            k = F.normalize(k_raw, dim=-1, eps=1e-8)
+            gamma_vec = self.decay_gamma(dtype=h.dtype, device=h.device)
+            q_alpha = q * alpha.view(1, 1, -1)
+            decay_out = self.decay_backend.compute(
+                q_alpha=q_alpha,
+                k=k,
+                h_norm=h_norm,
+                gamma_vec=gamma_vec,
+                buffers=DecayBuffers(causal_mask=self.causal_mask, decay_diff=self.decay_diff),
+            )
         out = out + decay_out
 
         if rosa_h is not None:
@@ -173,20 +200,51 @@ class KStack(nn.Module):
         share_k_base: bool = False,
         k_base_kernel_size: int = DEFAULT_K_BASE_KERNEL_SIZE,
         alpha_cap: float = 1.0,
-        gamma_min: float = 0.85,
+        gamma_min: float = 0.05,
         gamma_max: float = 1.0,
         decay_impl: str = "mask",
     ):
         super().__init__()
+        self.window = int(window)
+        self.rank = int(rank)
+        if self.rank <= 0:
+            raise ValueError(f"Expected rank > 0, got {self.rank}.")
         self.share_k_base = bool(share_k_base)
         self.k_base_impl = resolve_kbase_impl_name(k_base_impl)
         self.k_base_kernel_size = max(int(k_base_kernel_size), 1)
         self.k_base_backend = build_kbase_impl(self.k_base_impl)
+        self.gamma_min = float(gamma_min)
+        self.gamma_max = float(gamma_max)
+        if not (0.0 < self.gamma_min < self.gamma_max <= 1.0):
+            raise ValueError(
+                f"Expected 0 < gamma_min < gamma_max <= 1, got gamma_min={self.gamma_min}, gamma_max={self.gamma_max}."
+            )
+        self.decay_impl = str(decay_impl).strip().lower()
+        self.decay_backend = build_decay_impl(self.decay_impl)
+        self.decay_norm = RMSNorm(d)
+        self.decay_u = nn.Parameter(torch.randn(d, self.rank) * 0.05)
+        self.decay_v = nn.Parameter(torch.randn(d, self.rank) * 0.05)
+        if self.rank == 1:
+            decay_gamma_init = torch.tensor([0.5], dtype=torch.float32)
+        else:
+            decay_gamma_init = torch.linspace(0.2, 0.8, self.rank, dtype=torch.float32)
+        decay_gamma_init = decay_gamma_init.clamp(min=1e-6, max=1.0 - 1e-6)
+        self.decay_logit = nn.Parameter(torch.log(decay_gamma_init / (1.0 - decay_gamma_init)))
+        pos = torch.arange(self.window, dtype=torch.float32)
+        self.register_buffer("causal_mask", torch.tril(torch.ones(self.window, self.window)), persistent=False)
+        self.register_buffer(
+            "decay_diff",
+            (pos.unsqueeze(1) - pos.unsqueeze(0)).clamp(min=0).contiguous(),
+            persistent=False,
+        )
+        self._causal_mask_smoke_checked = False
         if self.share_k_base:
             self.shared_k_base_kernel = self.k_base_backend.default_parameter(self.k_base_kernel_size)
         else:
             self.register_parameter("shared_k_base_kernel", None)
         self.n_k2_layers = int(n_k2)
+        self.kappa_proj = nn.Linear(d, rank)
+        nn.init.constant_(self.kappa_proj.bias, -1.0)
 
         layers: List[nn.Module] = [K1Layer(d, mlp_dropout=mlp_dropout)]
         for _ in range(n_k2):
@@ -205,11 +263,58 @@ class KStack(nn.Module):
                     gamma_max=gamma_max,
                     decay_impl=decay_impl,
                     k_base_kernel_size=self.k_base_kernel_size,
+                    use_shared_decay=True,
                 )
             )
         layers.append(K1Layer(d, mlp_dropout=mlp_dropout))
         layers.append(K0Layer(d))
         self.layers = nn.ModuleList(layers)
+
+    def decay_gamma(self, *, dtype: torch.dtype | None = None, device: torch.device | None = None) -> torch.Tensor:
+        gamma = torch.sigmoid(self.decay_logit).clamp(min=self.gamma_min, max=self.gamma_max)
+        if dtype is not None or device is not None:
+            gamma = gamma.to(dtype=dtype if dtype is not None else gamma.dtype, device=device if device is not None else gamma.device)
+        return gamma
+
+    def _compute_shared_decay_rank_basis(self, h: torch.Tensor) -> torch.Tensor:
+        _, window, _ = h.shape
+        if window > self.window:
+            raise ValueError(f"Expected window <= {self.window}, got {window}")
+        if (not self._causal_mask_smoke_checked) and (not is_torch_compiling()):
+            mask = self.causal_mask
+            if mask.ndim != 2 or mask.size(0) != self.window or mask.size(1) != self.window:
+                raise RuntimeError(
+                    f"causal_mask shape mismatch: expected ({self.window}, {self.window}), got {tuple(mask.shape)}"
+                )
+            if not torch.equal(mask, torch.tril(mask)):
+                raise RuntimeError("causal_mask must be lower triangular (triangular smoke test failed).")
+            self._causal_mask_smoke_checked = True
+
+        h_norm = self.decay_norm(h)
+        kappa = torch.sigmoid(self.kappa_proj(h_norm))
+        qk = h_norm @ torch.cat((self.decay_u, self.decay_v), dim=1)
+        q_raw, k_raw = qk.split(self.rank, dim=-1)
+
+        q_raw = q_raw * kappa
+        k_raw = k_raw * kappa
+
+        q = F.normalize(q_raw, dim=-1, eps=1e-8)
+        k = F.normalize(k_raw, dim=-1, eps=1e-8)
+        gamma_vec = self.decay_gamma(dtype=h.dtype, device=h.device)
+
+        eye = torch.eye(self.rank, dtype=q.dtype, device=q.device)
+        rank_values: List[torch.Tensor] = []
+        for rank_idx in range(self.rank):
+            q_rank = q * eye[rank_idx].view(1, 1, -1)
+            out_rank = self.decay_backend.compute(
+                q_alpha=q_rank,
+                k=k,
+                h_norm=h_norm,
+                gamma_vec=gamma_vec,
+                buffers=DecayBuffers(causal_mask=self.causal_mask, decay_diff=self.decay_diff),
+            )
+            rank_values.append(out_rank.unsqueeze(2))
+        return torch.cat(rank_values, dim=2)
 
     def forward(
         self,
@@ -221,10 +326,18 @@ class KStack(nn.Module):
             raise ValueError(f"Expected rosa_layer_mask length {self.n_k2_layers}, got {len(rosa_layer_mask)}.")
 
         k2_idx = 0
+        shared_decay_basis: torch.Tensor | None = None
         for layer in self.layers:
             if isinstance(layer, K2Layer):
                 use_rosa = rosa_h is not None and (rosa_layer_mask is None or bool(rosa_layer_mask[k2_idx]))
-                h = layer(h, shared_k_base=self.shared_k_base_kernel, rosa_h=rosa_h if use_rosa else None)
+                if shared_decay_basis is None:
+                    shared_decay_basis = self._compute_shared_decay_rank_basis(h)
+                h = layer(
+                    h,
+                    shared_k_base=self.shared_k_base_kernel,
+                    shared_decay_basis=shared_decay_basis,
+                    rosa_h=rosa_h if use_rosa else None,
+                )
                 k2_idx += 1
             else:
                 h = layer(h)
@@ -256,9 +369,10 @@ class KStackModel(nn.Module):
         adaptive_cutoffs: List[int] | None = None,
         adaptive_div_value: float = 4.0,
         alpha_cap: float = 1.0,
-        gamma_min: float = 0.85,
+        gamma_min: float = 0.05,
         gamma_max: float = 1.0,
         decay_impl: str = "mask",
+        trajectory_aux: bool = False,
         rosa_impl: str = "exact",
         rosa_layers: str | None = "all",
     ):
@@ -276,6 +390,7 @@ class KStackModel(nn.Module):
         self.k_base_kernel_size = max(int(k_base_kernel_size), 1)
         self.share_k_base = bool(share_k_base)
         self.decay_impl = str(decay_impl).strip().lower()
+        self.trajectory_aux = bool(trajectory_aux) and self.head_mode != "trajectory"
         self.rosa_impl = str(rosa_impl).strip().lower()
         self.rosa_k2_layer_mask = resolve_k2_layer_mask(rosa_layers, n_k2, label="rosa_layers")
 
@@ -317,6 +432,20 @@ class KStackModel(nn.Module):
         self.tie_weights = self.head.tie_weights
         self.adaptive_cutoffs = list(self.head.adaptive_cutoffs)
         self.adaptive_div_value = float(self.head.adaptive_div_value)
+        if self.trajectory_aux:
+            self.trajectory_aux_head = build_head(
+                head_mode="trajectory",
+                d_model=self.d_model,
+                emb_dim=self.emb_dim,
+                vocab_size=self.vocab_size,
+                head_mult=self.head_mult,
+                head_dropout=head_dropout,
+                adaptive_cutoffs=[],
+                adaptive_div_value=adaptive_div_value,
+                embedding=self.emb,
+            )
+        else:
+            self.trajectory_aux_head = None
         if self.future_summary_horizons:
             predictor_hidden = self.d_model * 2
             self.future_summary_norm = RMSNorm(self.d_model)
@@ -332,6 +461,8 @@ class KStackModel(nn.Module):
             self.future_summary_heads = nn.ModuleDict()
 
         self.apply(self._init_weights)
+        if hasattr(self.k_stack, "kappa_proj"):
+            nn.init.constant_(self.k_stack.kappa_proj.bias, -1.0)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -380,6 +511,68 @@ class KStackModel(nn.Module):
                 elif shared_kernel is not None:
                     adapted[layer_kernel_key] = shared_kernel.clone()
 
+        def _resize_rank_vector(vec: torch.Tensor, target_rank: int) -> torch.Tensor:
+            if vec.ndim == 0:
+                return vec.expand(target_rank).clone()
+            flat = vec.reshape(-1)
+            if flat.numel() == target_rank:
+                return flat.clone()
+            if flat.numel() == 1:
+                return flat.expand(target_rank).clone()
+            out = flat.new_zeros(target_rank)
+            copy = min(int(flat.numel()), int(target_rank))
+            out[:copy] = flat[:copy]
+            return out
+
+        def _resize_rank_matrix(mat: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+            if mat.ndim == 1:
+                mat = mat.unsqueeze(0)
+            out = mat.new_zeros((rows, cols))
+            copy_rows = min(int(mat.size(0)), int(rows))
+            copy_cols = min(int(mat.size(1)), int(cols))
+            out[:copy_rows, :copy_cols] = mat[:copy_rows, :copy_cols]
+            return out
+
+        shared_decay_specs = (
+            ("k_stack.decay_u", "u", self.k_stack.decay_u),
+            ("k_stack.decay_v", "v", self.k_stack.decay_v),
+            ("k_stack.decay_logit", "decay_logit", self.k_stack.decay_logit),
+        )
+        for shared_key_name, legacy_suffix, target_param in shared_decay_specs:
+            shared_tensor = adapted.get(shared_key_name)
+            if isinstance(shared_tensor, torch.Tensor):
+                if target_param.ndim == 1:
+                    adapted[shared_key_name] = _resize_rank_vector(shared_tensor, int(target_param.numel()))
+                else:
+                    target_rows, target_cols = int(target_param.size(0)), int(target_param.size(1))
+                    adapted[shared_key_name] = _resize_rank_matrix(shared_tensor, target_rows, target_cols)
+            else:
+                legacy_tensors: List[torch.Tensor] = []
+                for layer_idx in layer_indices:
+                    legacy_key = f"k_stack.layers.{layer_idx}.{legacy_suffix}"
+                    tensor = adapted.pop(legacy_key, None)
+                    if isinstance(tensor, torch.Tensor):
+                        legacy_tensors.append(tensor)
+                if legacy_tensors:
+                    if target_param.ndim == 1:
+                        resized = [_resize_rank_vector(tensor, int(target_param.numel())) for tensor in legacy_tensors]
+                    else:
+                        target_rows, target_cols = int(target_param.size(0)), int(target_param.size(1))
+                        resized = [_resize_rank_matrix(tensor, target_rows, target_cols) for tensor in legacy_tensors]
+                    adapted[shared_key_name] = torch.stack(resized, dim=0).mean(dim=0)
+            for layer_idx in layer_indices:
+                adapted.pop(f"k_stack.layers.{layer_idx}.{legacy_suffix}", None)
+
+        if "k_stack.decay_norm.scale" not in adapted:
+            legacy_norm_scales: List[torch.Tensor] = []
+            for layer_idx in layer_indices:
+                legacy_norm_key = f"k_stack.layers.{layer_idx}.norm1.scale"
+                tensor = adapted.get(legacy_norm_key)
+                if isinstance(tensor, torch.Tensor):
+                    legacy_norm_scales.append(tensor)
+            if legacy_norm_scales:
+                adapted["k_stack.decay_norm.scale"] = torch.stack(legacy_norm_scales, dim=0).mean(dim=0)
+
         for key, tensor in list(adapted.items()):
             match = LAYER_ALPHA_LOGIT_KEY_RE.match(key)
             if match is None or not isinstance(tensor, torch.Tensor):
@@ -388,7 +581,7 @@ class KStackModel(nn.Module):
             layer = self.k_stack.layers[layer_idx] if 0 <= layer_idx < len(self.k_stack.layers) else None
             if not isinstance(layer, K2Layer):
                 continue
-            target_rank = int(layer.decay_logit.numel())
+            target_rank = int(layer.alpha_logit.numel())
             if tensor.ndim == 0:
                 adapted[key] = tensor.expand(target_rank).clone()
             elif tensor.ndim == 1 and tensor.numel() == 1:
@@ -410,6 +603,10 @@ class KStackModel(nn.Module):
                 if key.startswith("future_summary_heads.") and not any(
                     key.startswith(prefix) for prefix in valid_head_prefixes
                 ):
+                    adapted.pop(key, None)
+        if not self.trajectory_aux:
+            for key in list(adapted.keys()):
+                if key.startswith("trajectory_aux_head."):
                     adapted.pop(key, None)
 
         return self.head.adapt_state_dict(adapted)
@@ -457,6 +654,21 @@ class KStackModel(nn.Module):
     def loss_from_hidden(self, h: torch.Tensor, targets: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
         return self._loss_from_hidden(h, targets, reduction=reduction)
 
+    def trajectory_aux_scores_from_hidden(self, h: torch.Tensor) -> torch.Tensor | None:
+        if self.trajectory_aux_head is None:
+            return None
+        return self.trajectory_aux_head.scores(h)
+
+    def trajectory_aux_loss_from_hidden(
+        self,
+        h: torch.Tensor,
+        targets: torch.Tensor,
+        reduction: str = "mean",
+    ) -> torch.Tensor:
+        if self.trajectory_aux_head is None:
+            return torch.zeros((), device=h.device, dtype=torch.float32)
+        return self.trajectory_aux_head.loss(h, targets, reduction=reduction)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -489,6 +701,8 @@ class KStackModel(nn.Module):
             + list(self.rosa_to_model.parameters())
         )
         head_params = list(self.head.parameters())
+        if self.trajectory_aux_head is not None:
+            head_params += list(self.trajectory_aux_head.parameters())
 
         emb, emb_ptrs = _count_unique(emb_params)
         stack, emb_stack_ptrs = _count_unique(self.k_stack.parameters(), skip_ptrs=emb_ptrs)
